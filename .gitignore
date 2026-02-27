@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+trades.json
+entry_prices.json
+*.log
