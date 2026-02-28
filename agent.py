@@ -368,8 +368,10 @@ class RiskManager:
 
         limit = self._dynamic_daily_loss_limit()
         remaining = limit - daily_loss
-        log.info(f"🛡️  Daily P&L: -${daily_loss:.2f} ({daily_loss_pct:.1f}%) | "
-                 f"Limit: ${limit:.2f} | ${remaining:.2f} remaining before kill switch fires")
+        pnl = -daily_loss
+        pnl_pct = -daily_loss_pct
+        log.info(f"🛡️  Daily P&L: ${pnl:+.2f} ({pnl_pct:+.1f}%) | "
+        f"Limit: ${limit:.2f} | ${remaining:.2f} remaining before kill switch fires")
         return False, "OK"
 
     def can_trade(self, trade: dict, available_capital: float, regime: str = "neutral") -> tuple[bool, str]:
@@ -458,9 +460,9 @@ class PositionMonitor:
         if signal_score >= 16:
             return 45.0, 33.0   # high confidence: let it run, tighter SL
         elif signal_score >= 14:
-            return 42.0, 38.0   # medium-high
+            return 42.0, 33.0   # medium-high
         else:
-            return 38.0, 40.0   # standard
+            return 38.0, 33.0   # standard
 
     def check_and_exit(self):
         try:
@@ -593,6 +595,11 @@ class OptionsAgent:
     def run_once(self):
         log.info("=" * 60)
         log.info(f"[CYCLE] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        balance = self.risk.get_account_balance()
+        start = self.risk._start_of_day_capital or balance
+        day_pnl = balance - start
+        day_pnl_pct = (day_pnl / start * 100) if start > 0 else 0
+        log.info(f"💰 Account: ${balance:.2f} | Day P&L: ${day_pnl:+.2f} ({day_pnl_pct:+.1f}%) | Cash: ${self.risk.get_available_capital():.2f}")
 
         # 1. Monitor existing positions first
         log.info("Checking open positions...")
