@@ -1,7 +1,19 @@
 """
 OptionsAgent - Autonomous High-Volatility Options Trading Agent
-Broker: Tradier (paper trading sandbox)
+Broker: Tradier
 Strategy: Maximum aggression - momentum breakouts, volatility plays, 0DTE options
+
+IMPROVEMENTS v4:
+1. VIX filter — skip trades when VIX > 25
+2. SPY trend alignment — no CALLs on down days, no PUTs on up days
+3. Confluence requirement lowered to 2/3 timeframes (more opportunities)
+4. Score-based position sizing — higher score = more contracts
+5. Tighter stop loss — 25% instead of 33%
+6. Time-based exit — force close after 90 minutes of no movement
+7. Removed last-30-min theta block — full trading hours
+8. Hard capital cap — safe for margin accounts
+9. Capital scaling raised to 75% of gains above base
+10. SPY/QQQ prioritized on strong regime days
 """
 
 import os
@@ -18,7 +30,6 @@ from typing import Optional
 from config import CONFIG
 from signal_engine import SignalEngine
 
-# ── Logging ────────────────────────────────────────────────────────────────────
 import pytz
 
 class EasternFormatter(logging.Formatter):
@@ -81,7 +92,7 @@ class TradierClient:
             "class": "option",
             "symbol": symbol,
             "option_symbol": option_symbol,
-            "side": side,           # buy_to_open / sell_to_close
+            "side": side,
             "quantity": str(quantity),
             "type": order_type,
             "duration": "day",
@@ -100,15 +111,32 @@ class TradierClient:
         return self._get(f"/accounts/{CONFIG['account_id']}/orders")
 
 
+# ── VIX / SPY Market Filters ───────────────────────────────────────────────────
+def get_vix() -> float:
+    try:
+        vix = yf.Ticker("^VIX")
+        hist = vix.history(period="1d", interval="5m")
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
+    except:
+        pass
+    return 0.0
+
+def get_spy_day_change_pct() -> float:
+    try:
+        spy = yf.Ticker("SPY")
+        hist = spy.history(period="2d", interval="1d")
+        if len(hist) >= 2:
+            prev_close = float(hist["Close"].iloc[-2])
+            cur_close = float(hist["Close"].iloc[-1])
+            return (cur_close - prev_close) / prev_close * 100
+    except:
+        pass
+    return 0.0
+
+
 # ── Options Selector ───────────────────────────────────────────────────────────
 class OptionsSelector:
-    """
-    Selects the best option contract given a directional signal.
-    Strategy: slightly OTM, nearest weekly expiry (0DTE or 1-week out).
-    High delta (~0.40) for speed, low premium to maximize contracts.
-    Filters out wide bid/ask spreads to avoid slippage.
-    """
-
     def __init__(self, client: TradierClient):
         self.client = client
 
@@ -134,16 +162,8 @@ class OptionsSelector:
         direction = signal["direction"]
         current_price = signal["price"]
 
-        # ── IMPROVEMENT 2: Block entries in last 30 min of trading day ──
-        eastern = pytz.timezone("America/New_York")
-        now = datetime.now(eastern)
-        if now.hour == 15 and now.minute >= 30:
-            log.info(f"  ⏰ Skipping {ticker} — last 30min of trading day (theta risk)")
-            return None
-
-        # Target slightly OTM strike
         strike_offset = 1.02 if direction == "CALL" else 0.98
-        target_strike = round(current_price * strike_offset / 5) * 5  # round to $5
+        target_strike = round(current_price * strike_offset / 5) * 5
 
         expiry = self.get_nearest_expiry(ticker, days_out=CONFIG["min_days_to_expiry"])
         if not expiry:
@@ -163,12 +183,10 @@ class OptionsSelector:
             if isinstance(options, dict):
                 options = [options]
 
-            # Filter by direction and find closest strike
             side_options = [o for o in options if o.get("option_type", "").lower() == direction.lower()]
             if not side_options:
                 return None
 
-            # Find contract closest to target strike with reasonable delta
             best = None
             best_diff = float("inf")
             for opt in side_options:
@@ -183,11 +201,10 @@ class OptionsSelector:
                     if delta < 0.20 or delta > 0.70:
                         continue
 
-                    # ── IMPROVEMENT 3: Skip wide bid/ask spreads ──
                     mid = (ask + bid) / 2
                     if mid > 0:
                         spread_pct = (ask - bid) / mid
-                        if spread_pct > 0.20:  # >20% spread = too wide
+                        if spread_pct > 0.20:
                             continue
 
                     diff = abs(strike - target_strike)
@@ -201,7 +218,21 @@ class OptionsSelector:
                 return None
 
             ask_price = float(best["ask"])
-            max_spend = min(capital, CONFIG.get("max_trade_size", capital))
+
+            # ── Score-based position sizing ──
+            score = signal.get("score", 13)
+            confluence = signal.get("confluence", 0)
+
+            if score >= 17 and confluence >= 4:
+                size_multiplier = 1.0       # max size — all 3 TFs agree + very high score
+            elif score >= 16:
+                size_multiplier = 0.85
+            elif score >= 15.5:
+                size_multiplier = 0.70
+            else:
+                size_multiplier = 0.55      # half size for borderline signals
+
+            max_spend = min(capital, CONFIG.get("max_trade_size", capital)) * size_multiplier
             contracts = max(1, int(max_spend / (ask_price * 100)))
             total_cost = contracts * ask_price * 100
 
@@ -231,10 +262,12 @@ class OptionsSelector:
 class RiskManager:
     """
     Enforces hard limits:
-    - Max capital deployed at once (scales with account growth)
-    - Max concurrent positions (scales with account growth)
+    - Max capital deployed at once (scales with 75% of gains)
+    - Max concurrent positions
     - Daily loss limit kill switch
-    - Market regime direction filter
+    - VIX filter — no trades when VIX > 25
+    - SPY trend filter — no CALLs on down days, no PUTs on up days
+    - HARD CAP: never exceed capital_limit (margin-safe)
     """
 
     def __init__(self, client: TradierClient):
@@ -242,6 +275,8 @@ class RiskManager:
         self._start_of_day_capital: float = None
         self._last_reset_date: str = None
         self._killed_today: bool = False
+        self._vix_cache: tuple = (0, 0.0)
+        self._spy_cache: tuple = (0, 0.0)
 
     def _reset_if_new_day(self, current_capital: float):
         today = datetime.now().date().isoformat()
@@ -252,6 +287,18 @@ class RiskManager:
             log.info(f"New trading day. Starting capital: ${current_capital:.2f} | "
                      f"Daily loss limit: ${self._dynamic_daily_loss_limit():.2f}")
 
+    def _get_vix_cached(self) -> float:
+        now = time.time()
+        if now - self._vix_cache[0] > 300:
+            self._vix_cache = (now, get_vix())
+        return self._vix_cache[1]
+
+    def _get_spy_cached(self) -> float:
+        now = time.time()
+        if now - self._spy_cache[0] > 300:
+            self._spy_cache = (now, get_spy_day_change_pct())
+        return self._spy_cache[1]
+
     def get_available_capital(self) -> float:
         if CONFIG.get("sandbox", True):
             return float(CONFIG["capital_limit"])
@@ -261,16 +308,18 @@ class RiskManager:
             if isinstance(balances, dict):
                 cash = balances.get("cash", {})
                 if isinstance(cash, dict):
-                    return float(cash.get("cash_available", CONFIG["capital_limit"]))
+                    raw = float(cash.get("cash_available", CONFIG["capital_limit"]))
+                    return min(raw, float(CONFIG["capital_limit"]))  # HARD CAP
                 total = balances.get("total_cash", balances.get("cash_available", 0))
-                return float(total)
+                return min(float(total), float(CONFIG["capital_limit"]))  # HARD CAP
             return float(CONFIG["capital_limit"])
         except Exception as e:
             log.error(f"Balance fetch error: {e}")
             return float(CONFIG["capital_limit"])
 
     def get_account_balance(self) -> float:
-        """Get total account equity for dynamic sizing."""
+        """Real account equity for P&L and kill switch tracking — NOT capped.
+        Cap only applies to get_available_capital() to prevent margin usage."""
         if CONFIG.get("sandbox", True):
             return float(CONFIG["capital_limit"])
         try:
@@ -280,21 +329,20 @@ class RiskManager:
                 total = balances.get("total_equity",
                         balances.get("total_cash",
                         balances.get("cash_available", CONFIG["capital_limit"])))
-                return float(total)
+                return float(total)  # NO CAP — real balance for accurate P&L tracking
             return float(CONFIG["capital_limit"])
         except Exception as e:
             log.error(f"Balance fetch error: {e}")
             return float(CONFIG["capital_limit"])
 
     def _dynamic_capital_limit(self) -> float:
-        """Base capital + 50% of gains above initial capital."""
+        """Base capital + 75% of gains above initial capital (raised from 50%)."""
         base = float(CONFIG["capital_limit"])
         balance = self.get_account_balance()
         gains = max(0, balance - base)
-        return base + (gains * 0.50)
+        return base + (gains * 0.75)
 
     def _dynamic_max_positions(self) -> int:
-        """Scale max concurrent positions with account growth."""
         balance = self.get_account_balance()
         if balance >= 5000:
             return 5
@@ -304,7 +352,6 @@ class RiskManager:
             return 3
 
     def _dynamic_daily_loss_limit(self) -> float:
-        """Daily loss limit scales as 14% of portfolio value."""
         balance = self.get_account_balance()
         return round(balance * 0.14, 2)
 
@@ -321,7 +368,6 @@ class RiskManager:
             return 0
 
     def get_open_tickers(self) -> set:
-        """Return set of underlying tickers with currently open positions."""
         try:
             pos = self.client.get_positions()
             if not isinstance(pos, dict):
@@ -340,11 +386,8 @@ class RiskManager:
             return set()
 
     def check_daily_loss_limit(self, current_capital: float) -> tuple[bool, str]:
-        # Use total portfolio equity (includes open position value) for accurate loss tracking
-        # Falls back to current_capital in sandbox where equity API is unavailable
         portfolio_value = self.get_account_balance()
         if portfolio_value == float(CONFIG["capital_limit"]) and CONFIG.get("sandbox", True):
-            # Sandbox: can't get real portfolio value, use current_capital as proxy
             portfolio_value = current_capital
 
         self._reset_if_new_day(portfolio_value)
@@ -371,59 +414,62 @@ class RiskManager:
         pnl = -daily_loss
         pnl_pct = -daily_loss_pct
         log.info(f"🛡️  Daily P&L: ${pnl:+.2f} ({pnl_pct:+.1f}%) | "
-        f"Limit: ${limit:.2f} | ${remaining:.2f} remaining before kill switch fires")
+                 f"Limit: ${limit:.2f} | ${remaining:.2f} remaining before kill switch fires")
         return False, "OK"
 
     def can_trade(self, trade: dict, available_capital: float, regime: str = "neutral") -> tuple[bool, str]:
-        # Daily loss kill switch - checked first
         killed, reason = self.check_daily_loss_limit(available_capital)
         if killed:
             return False, reason
 
-        # Hard capital limit
         if available_capital < CONFIG["min_capital_to_trade"]:
             return False, f"Insufficient capital: ${available_capital:.2f}"
 
-        # Max concurrent positions
         open_positions = self.get_open_position_count()
         if open_positions >= self._dynamic_max_positions():
             return False, f"Max positions reached ({open_positions})"
 
-        # Trade cost check
-        if trade["total_cost"] > available_capital:
+        if trade["total_cost"] > available_capital * 1.01:  # 1% buffer for settlement rounding
             return False, f"Trade cost ${trade['total_cost']:.2f} > available ${available_capital:.2f}"
 
-        # Dynamic capital limit
         if trade["total_cost"] > self._dynamic_capital_limit():
             return False, f"Trade exceeds dynamic capital limit ${self._dynamic_capital_limit():.2f}"
 
-        # ── IMPROVEMENT 4: Block trades against strong market regime ──
         direction = trade.get("signal", {}).get("direction", "")
-        if regime == "bear" and direction == "CALL":
-            # Allow CALL only if signal is very high confidence
-            score = trade.get("signal", {}).get("score", 0)
-            if score < 16:
-                return False, f"Blocked CALL in BEAR market regime (score {score} < 16 threshold)"
-        if regime == "bull" and direction == "PUT":
-            score = trade.get("signal", {}).get("score", 0)
-            if score < 16:
-                return False, f"Blocked PUT in BULL market regime (score {score} < 16 threshold)"
+        score = trade.get("signal", {}).get("score", 0)
+
+        # ── VIX filter ──
+        vix = self._get_vix_cached()
+        if vix > 25:
+            log.info(f"⚠️  VIX={vix:.1f} > 25 — skipping trade")
+            return False, f"VIX too high ({vix:.1f})"
+
+        # ── SPY trend alignment ──
+        spy_chg = self._get_spy_cached()
+        if spy_chg < -1.0 and direction == "CALL" and score < 17:
+            return False, f"Blocked CALL — SPY down {spy_chg:.1f}% today (need score 17+, have {score})"
+        if spy_chg > 1.0 and direction == "PUT" and score < 17:
+            return False, f"Blocked PUT — SPY up {spy_chg:.1f}% today (need score 17+, have {score})"
+
+        # ── Regime filter ──
+        if regime == "bear" and direction == "CALL" and score < 16:
+            return False, f"Blocked CALL in BEAR regime (score {score} < 16)"
+        if regime == "bull" and direction == "PUT" and score < 16:
+            return False, f"Blocked PUT in BULL regime (score {score} < 16)"
 
         return True, "OK"
 
 
 # ── Position Monitor ───────────────────────────────────────────────────────────
 class PositionMonitor:
-    """
-    Monitors open positions and fires stop-loss / take-profit / trailing-stop exits.
-    """
-
     def __init__(self, client: TradierClient):
         self.client = client
-        self.entry_prices: dict = {}   # symbol -> entry_price
-        self.peak_prices: dict = {}    # symbol -> highest bid seen (for trailing stop)
-        self.recently_closed: set = set()  # tickers closed this cycle
-        self.daily_realized_pnl: float = 0.0  # running realized P&L today
+        self.entry_prices: dict = {}
+        self.peak_prices: dict = {}
+        self.entry_times: dict = {}
+        self.recently_closed: set = set()
+        self.pending_close: set = set()   # symbols with close order already placed
+        self.daily_realized_pnl: float = 0.0
         self._load_entry_prices()
 
     def _entry_prices_path(self):
@@ -435,7 +481,14 @@ class PositionMonitor:
             if os.path.exists(path):
                 with open(path, "r") as f:
                     self.entry_prices = json.load(f)
-                log.info(f"Loaded {len([k for k in self.entry_prices if not k.endswith('_score')])} entry price records from disk")
+                log.info(f"Loaded {len([k for k in self.entry_prices if not k.endswith('_score') and not k.endswith('_time')])} entry price records from disk")
+                for k, v in self.entry_prices.items():
+                    if k.endswith("_time"):
+                        symbol = k[:-5]
+                        try:
+                            self.entry_times[symbol] = datetime.fromisoformat(v)
+                        except:
+                            pass
         except Exception as e:
             log.warning(f"Could not load entry prices: {e}")
 
@@ -449,20 +502,18 @@ class PositionMonitor:
     def record_entry(self, option_symbol: str, entry_price: float, score: float = 13):
         self.entry_prices[option_symbol] = entry_price
         self.entry_prices[option_symbol + "_score"] = score
+        self.entry_prices[option_symbol + "_time"] = datetime.now().isoformat()
         self.peak_prices[option_symbol] = entry_price
+        self.entry_times[option_symbol] = datetime.now()
         self._save_entry_prices()
 
     def _dynamic_tp_sl(self, signal_score: float) -> tuple:
-        """
-        Scale TP/SL thresholds based on signal confidence.
-        Higher confidence = let winners run further, tighter stop.
-        """
         if signal_score >= 16:
-            return 45.0, 33.0   # high confidence: let it run, tighter SL
+            return 45.0, 25.0
         elif signal_score >= 14:
-            return 42.0, 33.0   # medium-high
+            return 42.0, 25.0
         else:
-            return 38.0, 33.0   # standard
+            return 38.0, 25.0
 
     def check_and_exit(self):
         try:
@@ -477,27 +528,28 @@ class PositionMonitor:
                 positions = [positions]
 
             for pos in positions:
-                symbol     = pos.get("symbol", "")
-                qty        = int(pos.get("quantity", 0))
-                cost_basis = float(pos.get("cost_basis", 0))
+                symbol      = pos.get("symbol", "")
+
+                # Skip if we already placed a close order this cycle
+                if symbol in self.pending_close:
+                    log.info(f"⏳ Skipping {symbol} — close order already pending")
+                    continue
+
+                qty         = int(pos.get("quantity", 0))
+                cost_basis  = float(pos.get("cost_basis", 0))
                 entry_price = cost_basis / (qty * 100) if qty > 0 else 0
 
-                # Get current market price
-                quote_resp   = self.client.get_quote(symbol)
-                quotes       = quote_resp.get("quotes", {}).get("quote", {})
-                current_bid  = float(quotes.get("bid", 0))
+                quote_resp  = self.client.get_quote(symbol)
+                quotes      = quote_resp.get("quotes", {}).get("quote", {})
+                current_bid = float(quotes.get("bid", 0))
 
                 if entry_price <= 0 or current_bid <= 0:
                     continue
 
-                pnl_pct = (current_bid - entry_price) / entry_price * 100
-
-                # Get dynamic thresholds for this position
+                pnl_pct   = (current_bid - entry_price) / entry_price * 100
                 sig_score = self.entry_prices.get(symbol + "_score", 13)
                 tp_pct, sl_pct = self._dynamic_tp_sl(sig_score)
 
-                # ── IMPROVEMENT 1: Trailing stop ──
-                # Update peak price seen for this position
                 if symbol not in self.peak_prices:
                     self.peak_prices[symbol] = entry_price
                 if current_bid > self.peak_prices[symbol]:
@@ -505,21 +557,25 @@ class PositionMonitor:
 
                 peak_pnl_pct = (self.peak_prices[symbol] - entry_price) / entry_price * 100
 
-                # Trailing stop — tightens as position grows
-                # Peak 20-29%: trail 15% from peak
-                # Peak 30-44%: trail 10% from peak
-                # Peak 45%+:   trail 7% from peak (lock in the big win)
-                trailing_stop_triggered = False
-                if peak_pnl_pct >= 20.0:
-                    if peak_pnl_pct >= 45.0:
-                        trail_pct = 7.0
-                    elif peak_pnl_pct >= 30.0:
+                # ── Time-based exit ──
+                entry_time = self.entry_times.get(symbol)
+                if entry_time:
+                    minutes_held = (datetime.now() - entry_time).total_seconds() / 60
+                    if minutes_held >= 90 and abs(pnl_pct) < 10:
+                        log.info(f"⏱️  TIME EXIT: {symbol} held {minutes_held:.0f}min with no movement ({pnl_pct:+.1f}%) | Selling {qty} contracts")
+                        self._close_position(symbol, qty, current_bid)
+                        continue
+
+                # Trailing stop
+                if peak_pnl_pct >= 30.0:
+                    if peak_pnl_pct >= 60.0:
                         trail_pct = 10.0
-                    else:
+                    elif peak_pnl_pct >= 45.0:
                         trail_pct = 15.0
+                    else:
+                        trail_pct = 20.0
                     pullback_from_peak = (self.peak_prices[symbol] - current_bid) / self.peak_prices[symbol] * 100
                     if pullback_from_peak >= trail_pct:
-                        trailing_stop_triggered = True
                         log.info(
                             f"🔒 TRAILING STOP: {symbol} peaked at +{peak_pnl_pct:.1f}%, "
                             f"pulled back {pullback_from_peak:.1f}% (trail: {trail_pct}%) | Selling {qty} contracts"
@@ -527,21 +583,18 @@ class PositionMonitor:
                         self._close_position(symbol, qty, current_bid)
                         continue
 
-                # Standard take profit
                 if pnl_pct >= tp_pct:
                     log.info(f"✅ TAKE PROFIT: {symbol} +{pnl_pct:.1f}% (threshold: +{tp_pct}%) | Selling {qty} contracts")
                     self._close_position(symbol, qty, current_bid)
-
-                # Standard stop loss
                 elif pnl_pct <= -sl_pct:
                     log.info(f"🛑 STOP LOSS: {symbol} {pnl_pct:.1f}% (threshold: -{sl_pct}%) | Selling {qty} contracts")
                     self._close_position(symbol, qty, current_bid)
-
                 else:
                     trail_info = f" | Peak: +{peak_pnl_pct:.1f}%" if peak_pnl_pct > 5 else ""
+                    time_info = f" | Held: {int((datetime.now() - entry_time).total_seconds() / 60)}min" if entry_time else ""
                     log.info(
                         f"Position {symbol}: P&L {pnl_pct:+.1f}% "
-                        f"(TP: +{tp_pct}% | SL: -{sl_pct}%{trail_info})"
+                        f"(TP: +{tp_pct}% | SL: -{sl_pct}%{trail_info}{time_info})"
                     )
 
         except Exception as e:
@@ -557,9 +610,8 @@ class PositionMonitor:
                 side="sell_to_close",
                 quantity=qty,
                 order_type="limit",
-                price=round(bid * 0.98, 2)  # slight discount to fill fast
+                price=round(bid * 0.98, 2)
             )
-            # Log realized P&L
             entry_price = self.entry_prices.get(option_symbol, bid)
             pnl_per_contract = (bid - entry_price) * 100
             total_pnl = pnl_per_contract * qty
@@ -568,18 +620,23 @@ class PositionMonitor:
             self.daily_realized_pnl += total_pnl
             log.info(f"{pnl_emoji} REALIZED P&L: {option_symbol} | Entry ${entry_price:.2f} → Exit ${bid:.2f} | {pnl_pct:+.1f}% | ${total_pnl:+.2f} ({qty} contracts) | Day total: ${self.daily_realized_pnl:+.2f}")
             log.info(f"Close order placed: {result}")
-            # Clean up tracking
+            self.pending_close.add(option_symbol)  # prevent repeat close attempts
             self.entry_prices.pop(option_symbol, None)
             self.entry_prices.pop(option_symbol + "_score", None)
+            self.entry_prices.pop(option_symbol + "_time", None)
             self.peak_prices.pop(option_symbol, None)
+            self.entry_times.pop(option_symbol, None)
+            self.pending_close.discard(option_symbol)  # clear once confirmed gone
             self._save_entry_prices()
-            # Track recently closed tickers for cooldown
             m = re.match(r'^([A-Z]+)', option_symbol)
             if m:
                 self.recently_closed.add(m.group(1))
         except Exception as e:
             log.error(f"Failed to close {option_symbol}: {e}")
 
+
+# ── Trade Judge (LLM Gate) ─────────────────────────────────────────────────────
+from trade_judge import TradeJudge
 
 # ── Main Agent Loop ────────────────────────────────────────────────────────────
 class OptionsAgent:
@@ -589,8 +646,30 @@ class OptionsAgent:
         self.selector = OptionsSelector(self.client)
         self.risk     = RiskManager(self.client)
         self.monitor  = PositionMonitor(self.client)
+        self.judge    = TradeJudge()
         self.trades_today: list = []
-        self.ticker_cooldown: dict = {}  # ticker -> timestamp of last close
+        self.ticker_cooldown: dict = {}
+
+    def _boost_index_signals(self, signals: list, regime: str, spy_chg: float) -> list:
+        """
+        On strong regime days, boost SPY/QQQ to front of queue.
+        Index options have best liquidity and tightest spreads.
+        """
+        index_tickers = {"SPY", "QQQ", "TQQQ", "SPXL"}
+        boosted = []
+        others = []
+        for sig in signals:
+            if sig["ticker"] in index_tickers:
+                # Boost index on strongly trending days
+                if (regime == "bear" and sig["direction"] == "PUT" and spy_chg < -0.5) or \
+                   (regime == "bull" and sig["direction"] == "CALL" and spy_chg > 0.5):
+                    sig["score"] = round(sig["score"] + 1.0, 1)
+                    log.info(f"📈 Index boost: {sig['ticker']} score +1.0 (regime aligned)")
+                boosted.append(sig)
+            else:
+                others.append(sig)
+        # Re-sort with boosted scores
+        return sorted(boosted + others, key=lambda x: (x.get("confluence", 0), x["score"]), reverse=True)
 
     def run_once(self):
         log.info("=" * 60)
@@ -599,19 +678,20 @@ class OptionsAgent:
         start = self.risk._start_of_day_capital or balance
         day_pnl = balance - start
         day_pnl_pct = (day_pnl / start * 100) if start > 0 else 0
-        log.info(f"💰 Account: ${balance:.2f} | Day P&L: ${day_pnl:+.2f} ({day_pnl_pct:+.1f}%) | Cash: ${self.risk.get_available_capital():.2f}")
 
-        # 1. Monitor existing positions first
+        vix = self.risk._get_vix_cached()
+        spy_chg = self.risk._get_spy_cached()
+        log.info(f"💰 Account: ${balance:.2f} | Day P&L: ${day_pnl:+.2f} ({day_pnl_pct:+.1f}%) | Cash: ${self.risk.get_available_capital():.2f}")
+        log.info(f"📈 SPY: {spy_chg:+.2f}% today | VIX: {vix:.1f}")
+
         log.info("Checking open positions...")
         self.monitor.check_and_exit()
 
-        # 1b. Apply cooldown for recently closed tickers (prevent same-cycle re-entry)
         for ticker in self.monitor.recently_closed:
-            self.ticker_cooldown[ticker] = datetime.now().timestamp() + 400  # 400s cooldown
+            self.ticker_cooldown[ticker] = datetime.now().timestamp() + 400
             log.info(f"Cooldown set for {ticker} — no re-entry for 400s")
         self.monitor.recently_closed.clear()
 
-        # 2. Check available capital
         capital = self.risk.get_available_capital()
         cap_limit = self.risk._dynamic_capital_limit()
         log.info(f"Available capital: ${capital:.2f} (limit: ${cap_limit:.2f})")
@@ -621,7 +701,11 @@ class OptionsAgent:
             log.info("Not enough capital to trade. Skipping signal scan.")
             return
 
-        # 3. Scan for signals
+        # VIX pre-check
+        if vix > 25:
+            log.info(f"⚠️  VIX={vix:.1f} — skipping scan, market too chaotic")
+            return
+
         log.info(f"Scanning watchlist: {CONFIG['watchlist']}")
         top_signals = self.signals.get_top_signals(min_score=CONFIG["min_signal_score"])
 
@@ -629,10 +713,19 @@ class OptionsAgent:
             log.info("No high-confidence signals found this cycle.")
             return
 
-        log.info(f"{len(top_signals)} signal(s) found. Top: {top_signals[0]['ticker']} "
+        # ── Confluence filter — require at least 2/3 timeframes to agree ──
+        top_signals = [s for s in top_signals if s.get("confluence", 0) >= 2]
+        if not top_signals:
+            log.info("No signals passed confluence filter (need 2/3 timeframes to agree).")
+            return
+
+        # ── Boost index options on strong trend days ──
+        regime = getattr(self.signals, 'last_regime', 'neutral')
+        top_signals = self._boost_index_signals(top_signals, regime, spy_chg)
+
+        log.info(f"{len(top_signals)} signal(s) passed filters. Top: {top_signals[0]['ticker']} "
                  f"({top_signals[0]['direction']}, score={top_signals[0]['score']})")
 
-        # 4. Select best contract — skip tickers already open, fall through on no contract
         open_tickers = self.risk.get_open_tickers()
         now_ts = datetime.now().timestamp()
         trade = None
@@ -664,14 +757,21 @@ class OptionsAgent:
             f"@ ${trade['ask']:.2f} | Total: ${trade['total_cost']:.2f} | Spread: {spread_pct:.1f}%"
         )
 
-        # 5. Risk check (pass regime for direction filter)
-        regime = getattr(self.signals, 'last_regime', 'neutral')
         can_trade, reason = self.risk.can_trade(trade, effective_capital, regime)
         if not can_trade:
             log.info(f"Risk manager blocked: {reason}")
             return
 
-        # 6. Execute
+        # ── LLM gate — final sanity check before execution ──
+        should_trade, judge_reason = self.judge.judge(
+            trade, best_signal, regime,
+            self.risk._get_vix_cached(),
+            self.risk._get_spy_cached()
+        )
+        if not should_trade:
+            log.info(f"🤖 TradeJudge BLOCKED: {judge_reason}")
+            return
+
         log.info(f"EXECUTING: Buy {trade['contracts']}x {trade['option_symbol']} @ market")
         try:
             result = self.client.place_order(
@@ -686,7 +786,6 @@ class OptionsAgent:
             self.trades_today.append({**trade, "result": result, "time": datetime.now().isoformat()})
             log.info(f"Order submitted: {json.dumps(result, indent=2)}")
 
-            # Save trade log
             with open("trades.json", "a") as f:
                 f.write(json.dumps({
                     **{k: v for k, v in trade.items() if k != "signal"},
@@ -699,7 +798,6 @@ class OptionsAgent:
             log.error(f"Order execution failed: {e}")
 
     def _write_daily_summary(self):
-        """IMPROVEMENT 5: Write daily P&L summary at market close."""
         eastern = pytz.timezone("America/New_York")
         today = datetime.now(eastern).strftime("%Y-%m-%d")
         if not self.trades_today:
@@ -719,11 +817,19 @@ class OptionsAgent:
         log.info(f"📊 ════════════════════════════════════════════════════")
 
     def run_loop(self):
-        log.info("OptionsAgent starting — MAXIMUM AGGRESSION MODE")
-        log.info(f"   Capital limit: ${self.risk._dynamic_capital_limit():.2f} (dynamic)")
-        log.info(f"   Take profit:   dynamic (score>=16: +45%, >=14: +42%, else: +38%)")
-        log.info(f"   Max positions: {self.risk._dynamic_max_positions()} (dynamic)")
-        log.info(f"   Sandbox:       {CONFIG['sandbox']}")
+        log.info("OptionsAgent starting — MAXIMUM AGGRESSION MODE v4")
+        log.info(f"   Capital limit:    ${self.risk._dynamic_capital_limit():.2f} (dynamic)")
+        log.info(f"   Capital scaling:  75% of gains reinvested (raised from 50%)")
+        log.info(f"   Take profit:      dynamic (score>=16: +45%, >=14: +42%, else: +38%)")
+        log.info(f"   Stop loss:        25% (tightened from 33%)")
+        log.info(f"   Max positions:    {self.risk._dynamic_max_positions()} (dynamic)")
+        log.info(f"   Confluence req:   2/3 timeframes must agree (relaxed from 3/3)")
+        log.info(f"   VIX filter:       skip trades when VIX > 25")
+        log.info(f"   SPY filter:       no CALLs on SPY <-1%, no PUTs on SPY >+1%")
+        log.info(f"   Index boost:      SPY/QQQ/TQQQ/SPXL prioritized on trend days")
+        log.info(f"   Time exit:        force close after 90min no movement")
+        log.info(f"   Theta block:      REMOVED — full trading hours until 4pm")
+        log.info(f"   Sandbox:          {CONFIG['sandbox']}")
 
         last_summary_date = None
 
@@ -740,7 +846,6 @@ class OptionsAgent:
                     time.sleep(3600)
                     continue
 
-                # Write daily summary once at market close
                 if hour == 16 and minute < 5 and last_summary_date != now.date():
                     self._write_daily_summary()
                     self.trades_today = []
@@ -749,7 +854,7 @@ class OptionsAgent:
                 market_open = (
                     (hour == 9 and minute >= 30) or
                     (10 <= hour <= 14) or
-                    (hour == 15 and minute <= 45)
+                    (hour == 15 and minute <= 59)
                 )
                 if not market_open:
                     log.info(f"Outside market hours ({hour}:{minute:02d} ET). Sleeping 5min.")
