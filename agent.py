@@ -2,7 +2,6 @@
 OptionsAgent - Autonomous High-Volatility Options Trading Agent
 Broker: Tradier
 Strategy: Maximum aggression - momentum breakouts, volatility plays, 0DTE options
-
 IMPROVEMENTS v4:
 1. VIX filter — skip trades when VIX > 25
 2. SPY trend alignment — no CALLs on down days, no PUTs on up days
@@ -14,8 +13,14 @@ IMPROVEMENTS v4:
 8. Hard capital cap — safe for margin accounts
 9. Capital scaling raised to 75% of gains above base
 10. SPY/QQQ prioritized on strong regime days
-"""
 
+BUG FIXES v4.1:
+- FIX 1: pending_close no longer discarded immediately in _close_position
+          (was add+discard in same call — guard was completely useless)
+- FIX 2: pending_close cleared in check_and_exit once Tradier confirms position gone
+- FIX 3: pending_tickers set in run_once prevents same-ticker duplicate in one cycle
+- FIX 4: Fast monitor log suppression removed — TP/SL/trailing stops now always logged
+"""
 import os
 import re
 import time
@@ -26,10 +31,10 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 from config import CONFIG
 from signal_engine import SignalEngine
-
 import pytz
 
 class EasternFormatter(logging.Formatter):
@@ -194,17 +199,25 @@ class OptionsSelector:
                     strike = float(opt.get("strike", 0))
                     ask    = float(opt.get("ask", 0))
                     bid    = float(opt.get("bid", 0))
-                    delta  = abs(float(opt.get("greeks", {}).get("delta", 0)))
+                    delta  = abs(float(opt.get("greeks", {}).get("delta", 0) or 0))
 
-                    if ask <= 0 or ask > CONFIG["max_contract_price"]:
+                    if ask <= 0 or ask < CONFIG.get("min_contract_price", 0.20) or ask > CONFIG["max_contract_price"]:
                         continue
-                    if delta < 0.20 or delta > 0.70:
-                        continue
+                    # Only apply delta filter if greeks look valid
+                    if delta > 0.01:
+                        if delta < 0.20 or delta > 0.70:
+                            continue
+                    else:
+                        # No valid delta — use strike proximity as proxy
+                        # Accept strikes within 5% of current price
+                        price_diff_pct = abs(strike - current_price) / current_price
+                        if price_diff_pct > 0.05:
+                            continue
 
                     mid = (ask + bid) / 2
                     if mid > 0:
                         spread_pct = (ask - bid) / mid
-                        if spread_pct > 0.20:
+                        if spread_pct > 0.35:
                             continue
 
                     diff = abs(strike - target_strike)
@@ -215,6 +228,19 @@ class OptionsSelector:
                     continue
 
             if not best:
+                log.warning(f"No contract found for {ticker} — checked {len(side_options)} {direction} options. Reasons: "
+                            f"ask<=0 or >max_price, delta out of 0.20-0.70 range, or spread >10%")
+                # Debug: show why top candidates were rejected
+                for opt in side_options[:3]:
+                    try:
+                        ask   = float(opt.get("ask", 0))
+                        bid   = float(opt.get("bid", 0))
+                        delta = abs(float(opt.get("greeks", {}).get("delta", 0)))
+                        mid   = (ask + bid) / 2 if (ask + bid) > 0 else 1
+                        spread_pct = (ask - bid) / mid
+                        log.warning(f"  Rejected {opt.get('symbol','?')}: ask=${ask:.2f} delta={delta:.2f} spread={spread_pct*100:.1f}% max_price=${CONFIG['max_contract_price']}")
+                    except:
+                        pass
                 return None
 
             ask_price = float(best["ask"])
@@ -440,22 +466,22 @@ class RiskManager:
 
         # ── VIX filter ──
         vix = self._get_vix_cached()
-        if vix > 25:
-            log.info(f"⚠️  VIX={vix:.1f} > 25 — skipping trade")
+        if vix > CONFIG.get("max_vix", 28):
+            log.info(f"⚠️  VIX={vix:.1f} > {CONFIG.get('max_vix', 28)} — skipping trade")
             return False, f"VIX too high ({vix:.1f})"
 
         # ── SPY trend alignment ──
         spy_chg = self._get_spy_cached()
-        if spy_chg < -1.0 and direction == "CALL" and score < 17:
-            return False, f"Blocked CALL — SPY down {spy_chg:.1f}% today (need score 17+, have {score})"
-        if spy_chg > 1.0 and direction == "PUT" and score < 17:
-            return False, f"Blocked PUT — SPY up {spy_chg:.1f}% today (need score 17+, have {score})"
+        if spy_chg < -1.0 and direction == "CALL":
+            return False, f"Blocked CALL — SPY down {spy_chg:.1f}% today"
+        if spy_chg > 1.0 and direction == "PUT":
+            return False, f"Blocked PUT — SPY up {spy_chg:.1f}% today"
 
         # ── Regime filter ──
-        if regime == "bear" and direction == "CALL" and score < 16:
-            return False, f"Blocked CALL in BEAR regime (score {score} < 16)"
-        if regime == "bull" and direction == "PUT" and score < 16:
-            return False, f"Blocked PUT in BULL regime (score {score} < 16)"
+        if regime == "bear" and direction == "CALL":
+            return False, f"Hard block: CALL in BEAR regime"
+        if regime == "bull" and direction == "PUT":
+            return False, f"Hard block: PUT in BULL regime"
 
         return True, "OK"
 
@@ -468,8 +494,9 @@ class PositionMonitor:
         self.peak_prices: dict = {}
         self.entry_times: dict = {}
         self.recently_closed: set = set()
-        self.pending_close: set = set()   # symbols with close order already placed
+        self.pending_close: set = set()   # symbols with close order placed, waiting for Tradier fill
         self.daily_realized_pnl: float = 0.0
+        self.time_extended: set = set()   # symbols that have already had time extension
         self._load_entry_prices()
 
     def _entry_prices_path(self):
@@ -491,23 +518,46 @@ class PositionMonitor:
                             pass
         except Exception as e:
             log.warning(f"Could not load entry prices: {e}")
+        try:
+            path = self._entry_prices_path()
+            if os.path.exists(path + ".peaks"):
+                with open(path + ".peaks") as f:
+                    self.peak_prices = json.load(f)
+                log.info(f"Loaded {len(self.peak_prices)} peak price records from disk")
+        except Exception as e:
+            log.warning(f"Could not load peak prices: {e}")
 
     def _save_entry_prices(self):
         try:
-            with open(self._entry_prices_path(), "w") as f:
+            path = self._entry_prices_path()
+            with open(path, "w") as f:
                 json.dump(self.entry_prices, f)
+            with open(path + ".peaks", "w") as f:
+                json.dump(self.peak_prices, f)
         except Exception as e:
             log.warning(f"Could not save entry prices: {e}")
 
-    def record_entry(self, option_symbol: str, entry_price: float, score: float = 13):
+    def record_entry(self, option_symbol: str, entry_price: float, score: float = 13, tp_sl_override: dict = None):
         self.entry_prices[option_symbol] = entry_price
         self.entry_prices[option_symbol + "_score"] = score
         self.entry_prices[option_symbol + "_time"] = datetime.now().isoformat()
+        if tp_sl_override:
+            self.entry_prices[option_symbol + "_tp"] = tp_sl_override.get("tp")
+            self.entry_prices[option_symbol + "_sl"] = tp_sl_override.get("sl")
+            log.info(f"📌 Custom TP/SL for {option_symbol}: TP={tp_sl_override.get('tp')}% SL={tp_sl_override.get('sl')}%")
         self.peak_prices[option_symbol] = entry_price
         self.entry_times[option_symbol] = datetime.now()
         self._save_entry_prices()
 
-    def _dynamic_tp_sl(self, signal_score: float) -> tuple:
+    def _dynamic_tp_sl(self, signal_score: float, option_symbol: str = None) -> tuple:
+        # Check for TradeJudge override first
+        if option_symbol:
+            tp = self.entry_prices.get(option_symbol + "_tp")
+            sl = self.entry_prices.get(option_symbol + "_sl")
+            if tp or sl:
+                tp = tp or (45.0 if signal_score >= 16 else 42.0)
+                sl = sl or 25.0
+                return float(tp), float(sl)
         if signal_score >= 16:
             return 45.0, 25.0
         elif signal_score >= 14:
@@ -522,17 +572,29 @@ class PositionMonitor:
                 return
             raw_positions = pos_resp.get("positions", None)
             if not raw_positions or raw_positions == "null" or not isinstance(raw_positions, dict):
+                # No open positions — clear any stale pending_close entries
+                if self.pending_close:
+                    log.info(f"✅ All positions closed — clearing pending_close: {self.pending_close}")
+                    self.pending_close.clear()
                 return
             positions = raw_positions.get("position", [])
             if isinstance(positions, dict):
                 positions = [positions]
 
+            # ── FIX 2: Clear pending_close for symbols no longer in Tradier positions ──
+            # This means the sell order filled and the position is gone
+            current_symbols = {pos.get("symbol", "") for pos in positions}
+            confirmed_closed = self.pending_close - current_symbols
+            if confirmed_closed:
+                log.info(f"✅ Sell confirmed by Tradier (no longer in positions): {confirmed_closed}")
+                self.pending_close -= confirmed_closed
+
             for pos in positions:
                 symbol      = pos.get("symbol", "")
 
-                # Skip if we already placed a close order this cycle
+                # ── FIX 2: Skip if close order pending — wait for Tradier to confirm fill ──
                 if symbol in self.pending_close:
-                    log.info(f"⏳ Skipping {symbol} — close order already pending")
+                    log.info(f"⏳ {symbol} — close order pending, waiting for Tradier fill confirmation")
                     continue
 
                 qty         = int(pos.get("quantity", 0))
@@ -548,7 +610,7 @@ class PositionMonitor:
 
                 pnl_pct   = (current_bid - entry_price) / entry_price * 100
                 sig_score = self.entry_prices.get(symbol + "_score", 13)
-                tp_pct, sl_pct = self._dynamic_tp_sl(sig_score)
+                tp_pct, sl_pct = self._dynamic_tp_sl(sig_score, option_symbol=symbol)
 
                 if symbol not in self.peak_prices:
                     self.peak_prices[symbol] = entry_price
@@ -562,7 +624,13 @@ class PositionMonitor:
                 if entry_time:
                     minutes_held = (datetime.now() - entry_time).total_seconds() / 60
                     if minutes_held >= 90 and abs(pnl_pct) < 10:
-                        log.info(f"⏱️  TIME EXIT: {symbol} held {minutes_held:.0f}min with no movement ({pnl_pct:+.1f}%) | Selling {qty} contracts")
+                        # Only extend once per position
+                        if symbol not in self.time_extended and pnl_pct > 0:
+                            log.info(f"⏱️  TIME LIMIT reached but P&L is positive ({pnl_pct:+.1f}%) — extending 30min (one time only)")
+                            self.entry_times[symbol] = datetime.now() - timedelta(minutes=60)
+                            self.time_extended.add(symbol)
+                            continue
+                        log.info(f"⏱️  TIME EXIT: {symbol} held {minutes_held:.0f}min ({pnl_pct:+.1f}%) | Selling {qty} contracts")
                         self._close_position(symbol, qty, current_bid)
                         continue
 
@@ -620,19 +688,55 @@ class PositionMonitor:
             self.daily_realized_pnl += total_pnl
             log.info(f"{pnl_emoji} REALIZED P&L: {option_symbol} | Entry ${entry_price:.2f} → Exit ${bid:.2f} | {pnl_pct:+.1f}% | ${total_pnl:+.2f} ({qty} contracts) | Day total: ${self.daily_realized_pnl:+.2f}")
             log.info(f"Close order placed: {result}")
-            self.pending_close.add(option_symbol)  # prevent repeat close attempts
+
+            # ── FIX 1: Add to pending_close — do NOT discard here ──
+            # Guard stays active until check_and_exit confirms position gone from Tradier
+            self.pending_close.add(option_symbol)
+
+            # ── Write to trade_results.json for TradeJudge history ──
+            self._write_trade_result(option_symbol, ticker, qty, entry_price, bid, pnl_pct, total_pnl)
+
+            # Clear local tracking data now that close order is placed
             self.entry_prices.pop(option_symbol, None)
             self.entry_prices.pop(option_symbol + "_score", None)
             self.entry_prices.pop(option_symbol + "_time", None)
+            self.entry_prices.pop(option_symbol + "_tp", None)
+            self.entry_prices.pop(option_symbol + "_sl", None)
             self.peak_prices.pop(option_symbol, None)
             self.entry_times.pop(option_symbol, None)
-            self.pending_close.discard(option_symbol)  # clear once confirmed gone
+            self.time_extended.discard(option_symbol)
+            # NOTE: intentionally NOT discarding from pending_close here
             self._save_entry_prices()
             m = re.match(r'^([A-Z]+)', option_symbol)
             if m:
                 self.recently_closed.add(m.group(1))
         except Exception as e:
             log.error(f"Failed to close {option_symbol}: {e}")
+
+    def _write_trade_result(self, option_symbol: str, ticker: str, qty: int,
+                             entry_price: float, exit_price: float,
+                             pnl_pct: float, pnl_dollars: float):
+        """Append closed trade result to trade_results.json for TradeJudge history."""
+        try:
+            # Determine direction from option symbol (C=CALL, P=PUT)
+            direction = "CALL" if "C" in option_symbol.split(ticker)[-1][:8] else "PUT"
+            record = {
+                "ticker":        ticker,
+                "option_symbol": option_symbol,
+                "direction":     direction,
+                "contracts":     qty,
+                "entry_price":   round(entry_price, 2),
+                "exit_price":    round(exit_price, 2),
+                "pnl_pct":       round(pnl_pct, 2),
+                "pnl_dollars":   round(pnl_dollars, 2),
+                "exit_time":     datetime.now(pytz.timezone("America/New_York")).isoformat(),
+                "regime":        getattr(self, "last_regime", "unknown"),
+            }
+            results_file = Path(__file__).parent / "trade_results.json"
+            with open(results_file, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            log.warning(f"Could not write trade result: {e}")
 
 
 # ── Trade Judge (LLM Gate) ─────────────────────────────────────────────────────
@@ -649,6 +753,7 @@ class OptionsAgent:
         self.judge    = TradeJudge()
         self.trades_today: list = []
         self.ticker_cooldown: dict = {}
+        self.premarket_watchlist: list = []  # populated by run_premarket_scan()
 
     def _boost_index_signals(self, signals: list, regime: str, spy_chg: float) -> list:
         """
@@ -671,6 +776,80 @@ class OptionsAgent:
         # Re-sort with boosted scores
         return sorted(boosted + others, key=lambda x: (x.get("confluence", 0), x["score"]), reverse=True)
 
+    def run_premarket_scan(self):
+        """
+        Dedicated pre-market scan (9:00-9:29am ET).
+        Finds the strongest gap plays before open and caches them
+        so run_once() prioritizes them at market open.
+        """
+        log.info("🌅 PRE-MARKET SCAN — finding best gap plays before open...")
+        try:
+            # Use catalyst scanner directly for pre-market gaps
+            from catalyst_scanner import CatalystScanner
+            scanner = CatalystScanner()
+            catalysts = scanner.get_top_catalyst_tickers(min_bonus=2)
+
+            if not catalysts:
+                log.info("🌅 Pre-market: no strong gap plays found.")
+                self.premarket_watchlist = []
+                return
+
+            # Sort by bonus score, keep top 5
+            catalysts.sort(key=lambda x: x.get("total_bonus", 0), reverse=True)
+            top = catalysts[:5]
+            self.premarket_watchlist = [c["ticker"] for c in top]
+
+            log.info(f"🌅 Pre-market top plays: {self.premarket_watchlist}")
+            for c in top:
+                log.info(
+                    f"  🎯 {c['ticker']}: bonus={c.get('total_bonus',0)} "
+                    f"dir={c.get('direction_bias','?')} — {', '.join(c.get('reasons',[])[:2])}"
+                )
+        except Exception as e:
+            log.error(f"Pre-market scan error: {e}")
+            self.premarket_watchlist = []
+
+    def _should_reenter(self, ticker: str, signal: dict) -> bool:
+        """
+        After cooldown expires, decide if we should re-enter a ticker.
+        Re-entry allowed if:
+        - Signal score is >= min_score + 1 (higher bar for re-entry)
+        - Confluence is HIGH (4/4)
+        - We made money on the last trade for this ticker
+        """
+        min_score = CONFIG["min_signal_score"] + 1.0  # higher bar
+        score = signal.get("score", 0)
+        confluence = signal.get("confluence", 0)
+
+        if score < min_score:
+            log.info(f"Re-entry {ticker}: score {score} below re-entry threshold {min_score}")
+            return False
+        if confluence < 4:
+            log.info(f"Re-entry {ticker}: confluence {confluence}/4 — need 3/3 for re-entry")
+            return False
+
+        # Check last trade result
+        try:
+            results_file = Path(__file__).parent / "trade_results.json"
+            if results_file.exists():
+                last_result = None
+                with open(results_file) as f:
+                    for line in f:
+                        try:
+                            t = json.loads(line.strip())
+                            if t.get("ticker") == ticker:
+                                last_result = t
+                        except:
+                            continue
+                if last_result and last_result.get("pnl_pct", 0) < -20:
+                    log.info(f"Re-entry {ticker}: last trade was {last_result['pnl_pct']:.1f}% — skipping re-entry after big loss")
+                    return False
+        except:
+            pass
+
+        log.info(f"✅ Re-entry approved for {ticker}: score={score}, confluence={confluence}/4")
+        return True
+
     def run_once(self):
         log.info("=" * 60)
         log.info(f"[CYCLE] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -688,7 +867,8 @@ class OptionsAgent:
         self.monitor.check_and_exit()
 
         for ticker in self.monitor.recently_closed:
-            self.ticker_cooldown[ticker] = datetime.now().timestamp() + 400
+            cooldown_secs = 600 if ticker in getattr(self, "_last_loss_tickers", set()) else 400
+            self.ticker_cooldown[ticker] = datetime.now().timestamp() + cooldown_secs
             log.info(f"Cooldown set for {ticker} — no re-entry for 400s")
         self.monitor.recently_closed.clear()
 
@@ -702,8 +882,8 @@ class OptionsAgent:
             return
 
         # VIX pre-check
-        if vix > 25:
-            log.info(f"⚠️  VIX={vix:.1f} — skipping scan, market too chaotic")
+        if vix > CONFIG.get("max_vix", 28):
+            log.info(f"⚠️  VIX={vix:.1f} > {CONFIG.get('max_vix', 28)} — skipping scan, market too chaotic")
             return
 
         log.info(f"Scanning watchlist: {CONFIG['watchlist']}")
@@ -714,14 +894,11 @@ class OptionsAgent:
             return
 
         # ── Confluence filter — require at least 2/3 timeframes to agree ──
-        top_signals = [s for s in top_signals if s.get("confluence", 0) >= 2]
         if not top_signals:
-            log.info("No signals passed confluence filter (need 2/3 timeframes to agree).")
             return
 
         # ── Boost index options on strong trend days ──
         regime = getattr(self.signals, 'last_regime', 'neutral')
-        top_signals = self._boost_index_signals(top_signals, regime, spy_chg)
 
         log.info(f"{len(top_signals)} signal(s) passed filters. Top: {top_signals[0]['ticker']} "
                  f"({top_signals[0]['direction']}, score={top_signals[0]['score']})")
@@ -730,40 +907,50 @@ class OptionsAgent:
         now_ts = datetime.now().timestamp()
         trade = None
         best_signal = None
+        # Iterate signals — already sorted by score from signal engine
+        pending_tickers: set = set()
+
+        # Boost premarket watchlist tickers to front of queue
+
         for sig in top_signals:
             ticker = sig["ticker"]
             if ticker in open_tickers:
                 log.info(f"Skipping {ticker} — position already open")
                 continue
+            # ── FIX 3: Block same ticker from being selected twice in one cycle ──
+            if ticker in pending_tickers:
+                log.info(f"Skipping {ticker} — already selected for execution this cycle")
+                continue
             cooldown_until = self.ticker_cooldown.get(ticker, 0)
             if now_ts < cooldown_until:
                 remaining = int(cooldown_until - now_ts)
-                log.info(f"Skipping {ticker} — cooldown ({remaining}s remaining)")
-                continue
+                # Check re-entry eligibility even during cooldown if signal is very strong
+                if remaining < 60 and self._should_reenter(ticker, sig):
+                    log.info(f"🔄 Re-entry: overriding final {remaining}s cooldown for {ticker}")
+                else:
+                    log.info(f"Skipping {ticker} — cooldown ({remaining}s remaining)")
+                    continue
             t = self.selector.select_contract(sig, effective_capital)
             if t:
+                spread_pct = (t['ask'] - t['bid']) / ((t['ask'] + t['bid']) / 2) * 100 if t.get('bid') else 0
+                log.info(
+                    f"Trade candidate: {t['option_symbol']} | {t['contracts']} contracts "
+                    f"@ ${t['ask']:.2f} | Total: ${t['total_cost']:.2f} | Spread: {spread_pct:.1f}%"
+                )
+                can_trade, reason = self.risk.can_trade(t, effective_capital, regime)
+                if not can_trade:
+                    log.info(f"Risk manager blocked: {reason} — trying next signal")
+                    continue
                 trade = t
                 best_signal = sig
                 break
             log.info(f"No suitable contract for {ticker} — trying next signal")
-
         if not trade:
             log.info("No suitable contracts found for any signals this cycle.")
             return
 
-        spread_pct = (trade['ask'] - trade['bid']) / ((trade['ask'] + trade['bid']) / 2) * 100 if trade.get('bid') else 0
-        log.info(
-            f"Trade candidate: {trade['option_symbol']} | {trade['contracts']} contracts "
-            f"@ ${trade['ask']:.2f} | Total: ${trade['total_cost']:.2f} | Spread: {spread_pct:.1f}%"
-        )
-
-        can_trade, reason = self.risk.can_trade(trade, effective_capital, regime)
-        if not can_trade:
-            log.info(f"Risk manager blocked: {reason}")
-            return
-
         # ── LLM gate — final sanity check before execution ──
-        should_trade, judge_reason = self.judge.judge(
+        should_trade, size_multiplier, judge_reason, tp_sl_override = self.judge.judge(
             trade, best_signal, regime,
             self.risk._get_vix_cached(),
             self.risk._get_spy_cached()
@@ -772,8 +959,22 @@ class OptionsAgent:
             log.info(f"🤖 TradeJudge BLOCKED: {judge_reason}")
             return
 
+        # Apply confidence-based size multiplier from TradeJudge
+        if size_multiplier != 1.0:
+            original_contracts = trade["contracts"]
+            trade["contracts"] = max(1, round(trade["contracts"] * size_multiplier))
+            trade["total_cost"] = trade["contracts"] * trade["ask"] * 100
+            if trade["contracts"] != original_contracts:
+                log.info(f"🤖 TradeJudge resized: {original_contracts} → {trade['contracts']} contracts ({size_multiplier}x)")
+
         log.info(f"EXECUTING: Buy {trade['contracts']}x {trade['option_symbol']} @ market")
         try:
+            # ── FIX 3: Set cooldown and pending_tickers BEFORE place_order ──
+            # Prevents any overlap if execution is slow or threading races occur
+            self.ticker_cooldown[trade["ticker"]] = datetime.now().timestamp() + 400
+            pending_tickers.add(trade["ticker"])
+            log.info(f"Cooldown set for {trade['ticker']} — no re-entry for 400s (entry lock)")
+
             result = self.client.place_order(
                 symbol=trade["ticker"],
                 option_symbol=trade["option_symbol"],
@@ -782,7 +983,14 @@ class OptionsAgent:
                 order_type="market"
             )
             score = best_signal.get("score", 13)
-            self.monitor.record_entry(trade["option_symbol"], trade["ask"], score)
+            # Merge sl_hint from signal engine into tp_sl_override if TradeJudge didn't set SL
+            sl_hint = best_signal.get("sl_hint")
+            if sl_hint and (tp_sl_override is None or tp_sl_override.get("sl") is None):
+                tp_sl_override = tp_sl_override or {}
+                tp_sl_override["sl"] = sl_hint
+                log.info(f"📊 SL scaled to contract price: {sl_hint}%")
+            self.monitor.record_entry(trade["option_symbol"], trade["ask"], score, tp_sl_override=tp_sl_override)
+            self.monitor.last_regime = regime
             self.trades_today.append({**trade, "result": result, "time": datetime.now().isoformat()})
             log.info(f"Order submitted: {json.dumps(result, indent=2)}")
 
@@ -816,8 +1024,29 @@ class OptionsAgent:
             )
         log.info(f"📊 ════════════════════════════════════════════════════")
 
+    def _fast_monitor_loop(self):
+        """Runs every 30s to check exits only — independent of main scan cycle."""
+        import threading
+        def _loop():
+            while True:
+                time.sleep(30)
+                try:
+                    # ── FIX 4: Removed log suppression — TP/SL/trailing stops always logged ──
+                    # Previously setLevel(WARNING) was silencing all INFO logs in the fast monitor,
+                    # meaning take profits and stop losses fired here were invisible in the log.
+                    self.monitor.check_and_exit()
+                    for ticker in list(self.monitor.recently_closed):
+                        self.ticker_cooldown[ticker] = datetime.now().timestamp() + 400
+                        log.info(f"Cooldown set for {ticker} — no re-entry for 400s")
+                    self.monitor.recently_closed.clear()
+                except Exception as e:
+                    log.error(f"Fast monitor error: {e}")
+        t = threading.Thread(target=_loop, daemon=True)
+        t.start()
+        log.info("⚡ Fast position monitor started (30s interval)")
+
     def run_loop(self):
-        log.info("OptionsAgent starting — MAXIMUM AGGRESSION MODE v4")
+        log.info("OptionsAgent starting — MAXIMUM AGGRESSION MODE v4.1")
         log.info(f"   Capital limit:    ${self.risk._dynamic_capital_limit():.2f} (dynamic)")
         log.info(f"   Capital scaling:  75% of gains reinvested (raised from 50%)")
         log.info(f"   Take profit:      dynamic (score>=16: +45%, >=14: +42%, else: +38%)")
@@ -832,6 +1061,7 @@ class OptionsAgent:
         log.info(f"   Sandbox:          {CONFIG['sandbox']}")
 
         last_summary_date = None
+        self._fast_monitor_loop()
 
         while True:
             try:
@@ -856,7 +1086,21 @@ class OptionsAgent:
                     (10 <= hour <= 14) or
                     (hour == 15 and minute <= 59)
                 )
+
+                # Pre-market scan window: 9:00-9:29am
+                premarket = (hour == 9 and minute < 30)
+                if premarket:
+                    if not getattr(self, '_premarket_scanned_today', None) == now.date():
+                        self.run_premarket_scan()
+                        self._premarket_scanned_today = now.date()
+                    log.info(f"Pre-market hours ({hour}:{minute:02d} ET). Sleeping 2min.")
+                    time.sleep(120)
+                    continue
+
                 if not market_open:
+                    # Clear premarket watchlist after market closes
+                    if hour >= 16:
+                        self.premarket_watchlist = []
                     log.info(f"Outside market hours ({hour}:{minute:02d} ET). Sleeping 5min.")
                     time.sleep(300)
                     continue

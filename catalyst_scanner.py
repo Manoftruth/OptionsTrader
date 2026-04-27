@@ -22,6 +22,7 @@ import requests
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 from datetime import datetime, timedelta
 
@@ -160,46 +161,38 @@ class CatalystScanner:
         now = time.time()
         results = {}
 
+        to_fetch = []
         for ticker in tickers:
-            # Check cache
             if ticker in _GAP_CACHE:
                 cached_time, cached_val = _GAP_CACHE[ticker]
-                if now - cached_time < 300:  # 5 min cache for gaps
+                if now - cached_time < 1800:
                     results[ticker] = cached_val
                     continue
+            to_fetch.append(ticker)
 
+        def _fetch_gap(ticker):
             try:
                 stock = yf.Ticker(ticker)
-
-                # Get pre-market quote
                 info = stock.fast_info
-
                 prev_close  = float(info.previous_close or 0)
                 current     = float(info.last_price or 0)
-                pre_volume  = float(info.three_month_average_volume or 0)
-
                 if prev_close <= 0 or current <= 0:
-                    results[ticker] = None
-                    continue
-
+                    return ticker, None
                 gap_pct = ((current - prev_close) / prev_close) * 100
-
-                # Get today's intraday volume vs average
                 try:
                     hist = yf.download(ticker, period="2d", interval="1m",
                                        progress=False, auto_adjust=True)
                     if not hist.empty:
-                        today = datetime.now().date()
+                        from datetime import datetime as _dt
+                        today = _dt.now().date()
                         today_data = hist[hist.index.date == today]
                         today_volume = float(today_data["Volume"].sum()) if not today_data.empty else 0
                         avg_daily_vol = float(info.three_month_average_volume or 1)
-                        # Normalize: how much of daily avg volume traded already today
                         vol_ratio = today_volume / (avg_daily_vol / 6.5) if avg_daily_vol > 0 else 1
                     else:
                         vol_ratio = 1
                 except:
                     vol_ratio = 1
-
                 gap_data = {
                     "gap_pct": gap_pct,
                     "prev_close": prev_close,
@@ -207,14 +200,20 @@ class CatalystScanner:
                     "vol_ratio": vol_ratio,
                     "direction": "CALL" if gap_pct > 0 else "PUT"
                 }
-
-                results[ticker] = gap_data
                 _GAP_CACHE[ticker] = (now, gap_data)
-
+                return ticker, gap_data
             except Exception as e:
                 log.debug(f"Gap scan error {ticker}: {e}")
-                results[ticker] = None
+                return ticker, None
 
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            futures = {ex.submit(_fetch_gap, t): t for t in to_fetch}
+            for future in as_completed(futures):
+                try:
+                    ticker, val = future.result()
+                    results[ticker] = val
+                except Exception:
+                    pass
         return results
 
     def score_gap(self, ticker: str, gap_data: dict | None) -> dict:

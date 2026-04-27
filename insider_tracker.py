@@ -257,7 +257,39 @@ class InsiderTracker:
             })
 
         ranked.sort(key=lambda x: (x["score"], x["total_buy_value"]), reverse=True)
-        top = ranked[:MAX_RESULTS]
+
+        # Filter out micro-caps with no liquid options (saves signal engine time)
+        def _has_tradeable_options(ticker):
+            try:
+                import yfinance as yf
+                tk = yf.Ticker(ticker)
+                expirations = tk.options
+                if not expirations:
+                    return False
+                chain = tk.option_chain(expirations[0])
+                calls = chain.calls
+                if calls.empty:
+                    return False
+                # Require OI >= 500 AND at least one contract with tight spread
+                max_oi = calls["openInterest"].fillna(0).max()
+                if max_oi < 500:
+                    return False
+                # Check for at least one contract with spread < 20%
+                calls = calls[(calls["ask"] > 0) & (calls["bid"] > 0)]
+                if calls.empty:
+                    return False
+                mid = (calls["ask"] + calls["bid"]) / 2
+                spread_pct = (calls["ask"] - calls["bid"]) / mid
+                return bool((spread_pct < 0.20).any())
+            except:
+                return False
+
+        filtered = [r for r in ranked if _has_tradeable_options(r["ticker"])]
+        if len(filtered) < len(ranked):
+            removed = [r["ticker"] for r in ranked if r not in filtered]
+            log.info(f"  Filtered out illiquid insider tickers: {removed}")
+
+        top = filtered[:MAX_RESULTS]
         _DAILY_CACHE[today] = top
         return top
 
