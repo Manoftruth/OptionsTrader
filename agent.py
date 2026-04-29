@@ -494,7 +494,9 @@ class PositionMonitor:
         self.peak_prices: dict = {}
         self.entry_times: dict = {}
         self.recently_closed: set = set()
-        self.pending_close: set = set()   # symbols with close order placed, waiting for Tradier fill
+        self.pending_close: set = set()         # symbols with close order placed, waiting for Tradier fill
+        self.pending_close_times: dict = {}     # symbol → timestamp when close order was placed
+        self.pending_close_order_ids: dict = {} # symbol → Tradier order ID of the close order
         self.daily_realized_pnl: float = 0.0
         self.time_extended: set = set()   # symbols that have already had time extension
         self._load_entry_prices()
@@ -576,6 +578,8 @@ class PositionMonitor:
                 if self.pending_close:
                     log.info(f"✅ All positions closed — clearing pending_close: {self.pending_close}")
                     self.pending_close.clear()
+                    self.pending_close_times.clear()
+                    self.pending_close_order_ids.clear()
                 return
             positions = raw_positions.get("position", [])
             if isinstance(positions, dict):
@@ -588,13 +592,56 @@ class PositionMonitor:
             if confirmed_closed:
                 log.info(f"✅ Sell confirmed by Tradier (no longer in positions): {confirmed_closed}")
                 self.pending_close -= confirmed_closed
+                for _sym in confirmed_closed:
+                    self.pending_close_times.pop(_sym, None)
+                    self.pending_close_order_ids.pop(_sym, None)
 
             for pos in positions:
                 symbol      = pos.get("symbol", "")
 
-                # ── FIX 2: Skip if close order pending — wait for Tradier to confirm fill ──
+                # ── Skip if close order pending — wait for fill, or timeout and go market ──
                 if symbol in self.pending_close:
-                    log.info(f"⏳ {symbol} — close order pending, waiting for Tradier fill confirmation")
+                    elapsed = time.time() - self.pending_close_times.get(symbol, time.time())
+                    max_wait = CONFIG.get("close_order_timeout_secs", 300)
+                    if elapsed < max_wait:
+                        log.info(f"⏳ {symbol} — close order pending ({elapsed:.0f}s / {max_wait}s)")
+                        continue
+                    log.warning(f"⚠️  CLOSE TIMEOUT: {symbol} unfilled after {elapsed:.0f}s — canceling and going market")
+                    order_id = self.pending_close_order_ids.get(symbol)
+                    if order_id:
+                        try:
+                            self.client.cancel_order(order_id)
+                            log.info(f"🗑️  Canceled stale close order {order_id} for {symbol}")
+                        except Exception as ce:
+                            log.warning(f"Could not cancel order {order_id}: {ce} — submitting market order anyway")
+                    self.pending_close.discard(symbol)
+                    self.pending_close_times.pop(symbol, None)
+                    self.pending_close_order_ids.pop(symbol, None)
+                    try:
+                        quote_resp  = self.client.get_quote(symbol)
+                        quotes      = quote_resp.get("quotes", {}).get("quote", {})
+                        current_bid = float(quotes.get("bid", 0))
+                        if current_bid > 0:
+                            m2 = re.match(r'^([A-Z]+)', symbol)
+                            tkr = m2.group(1) if m2 else symbol[:6]
+                            qty2 = int(pos.get("quantity", 0))
+                            mkt_result = self.client.place_order(
+                                symbol=tkr,
+                                option_symbol=symbol,
+                                side="sell_to_close",
+                                quantity=qty2,
+                                order_type="market"
+                            )
+                            self.pending_close.add(symbol)
+                            self.pending_close_times[symbol] = time.time()
+                            new_oid = str(mkt_result.get("order", {}).get("id", ""))
+                            if new_oid:
+                                self.pending_close_order_ids[symbol] = new_oid
+                            log.info(f"📤 Market close resubmitted for {symbol}: {mkt_result}")
+                        else:
+                            log.error(f"❌ Could not get bid for {symbol} — manual intervention needed")
+                    except Exception as me:
+                        log.error(f"Failed to resubmit market close for {symbol}: {me}")
                     continue
 
                 qty         = int(pos.get("quantity", 0))
@@ -689,9 +736,12 @@ class PositionMonitor:
             log.info(f"{pnl_emoji} REALIZED P&L: {option_symbol} | Entry ${entry_price:.2f} → Exit ${bid:.2f} | {pnl_pct:+.1f}% | ${total_pnl:+.2f} ({qty} contracts) | Day total: ${self.daily_realized_pnl:+.2f}")
             log.info(f"Close order placed: {result}")
 
-            # ── FIX 1: Add to pending_close — do NOT discard here ──
-            # Guard stays active until check_and_exit confirms position gone from Tradier
+            # ── Add to pending_close — guard stays active until Tradier confirms fill ──
             self.pending_close.add(option_symbol)
+            self.pending_close_times[option_symbol] = time.time()
+            close_order_id = str(result.get("order", {}).get("id", ""))
+            if close_order_id:
+                self.pending_close_order_ids[option_symbol] = close_order_id
 
             # ── Write to trade_results.json for TradeJudge history ──
             self._write_trade_result(option_symbol, ticker, qty, entry_price, bid, pnl_pct, total_pnl)
