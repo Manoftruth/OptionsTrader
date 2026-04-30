@@ -606,6 +606,15 @@ class PositionMonitor:
                     if elapsed < max_wait:
                         log.info(f"⏳ {symbol} — close order pending ({elapsed:.0f}s / {max_wait}s)")
                         continue
+                    # Don't cancel/resubmit outside market hours — orders can't fill anyway
+                    _now_et = datetime.now(pytz.timezone("America/New_York"))
+                    _market_open = (
+                        (_now_et.hour == 9 and _now_et.minute >= 30) or
+                        (10 <= _now_et.hour <= 15)
+                    )
+                    if not _market_open:
+                        log.info(f"⏳ {symbol} — close order pending ({elapsed:.0f}s), market closed — holding until open")
+                        continue
                     log.warning(f"⚠️  CLOSE TIMEOUT: {symbol} unfilled after {elapsed:.0f}s — canceling and going market")
                     order_id = self.pending_close_order_ids.get(symbol)
                     if order_id:
