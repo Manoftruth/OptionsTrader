@@ -1,6 +1,11 @@
 """
 TradeJudge - LLM-powered final gate before trade execution.
 
+v4.2 fixes:
+- FAIL SAFE: API errors now default to SKIP instead of BUY
+  Prevents TradeJudge from being bypassed when the API times out or errors
+- Better HTTP error logging: logs status code + response body on failure
+
 v4.1 fixes:
 - None guard on Anthropic API response content before calling .get()
   Prevents: 'NoneType' object has no attribute 'get' — defaulting to BUY 1.0x
@@ -59,7 +64,7 @@ class TradeJudge:
         elif not self.api_key:
             log.info("TradeJudge: disabled (no anthropic_api_key in config)")
         else:
-            log.info("TradeJudge: enabled — multi-turn reasoning + history (v4.1)")
+            log.info("TradeJudge: enabled — multi-turn reasoning + history (v4.2)")
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -196,13 +201,8 @@ class TradeJudge:
 
     def _call_api(self, messages: list, max_tokens: int = 200) -> str:
         """
-        FIX: Added explicit None/type guards at every level of the response.
-
-        Root cause of 'NoneType' object has no attribute 'get':
-          data.get("content") returned None when the API response was malformed
-          or the request timed out and returned a non-standard payload.
-          Previously the code called content[0].get("text") without checking
-          whether content itself was None or whether content[0] was a dict.
+        FIX v4.2: Better HTTP error logging — logs status + body on failure.
+        FIX v4.1: Explicit None/type guards at every level of the response.
         """
         headers = {
             "x-api-key": self.api_key,
@@ -215,26 +215,30 @@ class TradeJudge:
             "messages": messages
         }
         resp = requests.post(self.api_url, headers=headers, json=body, timeout=10)
-        resp.raise_for_status()
+
+        # FIX v4.2: Log HTTP errors with response body before raising
+        if not resp.ok:
+            raise ValueError(f"API HTTP {resp.status_code}: {resp.text[:300]}")
+
         data = resp.json()
 
-        # FIX: Guard 1 — content key missing or None
+        # Guard 1 — content key missing or None
         content = data.get("content")
         if not content:
             raise ValueError(f"API response missing content field: {data}")
 
-        # FIX: Guard 2 — content is not a list (unexpected response shape)
+        # Guard 2 — content is not a list (unexpected response shape)
         if not isinstance(content, list):
             raise ValueError(f"API response content is not a list: {type(content)} — {content}")
 
-        # FIX: Guard 3 — first block is None or not a dict
+        # Guard 3 — first block is None or not a dict
         first_block = content[0]
         if first_block is None:
             raise ValueError(f"API response content[0] is None")
         if not isinstance(first_block, dict):
             raise ValueError(f"API response content[0] is not a dict: {type(first_block)}")
 
-        # FIX: Guard 4 — text key missing or None
+        # Guard 4 — text key missing or None
         text = first_block.get("text")
         if not text:
             raise ValueError(f"No text in API response content block: {first_block}")
@@ -250,7 +254,7 @@ class TradeJudge:
           Turn 1 — Claude analyzes using data the signal engine can't see
           Turn 2 — Claude gives final STRONG_BUY/BUY/SKIP/STRONG_SKIP decision
 
-        Returns (should_trade, size_multiplier, reason)
+        Returns (should_trade, size_multiplier, reason, tp_sl_override)
         """
         if not self.enabled:
             return True, 1.0, "TradeJudge disabled — proceeding", None
@@ -368,5 +372,7 @@ Current score for reference: {score}/20"""}
             return should_trade, size_multiplier, decision, tp_sl_override
 
         except Exception as e:
-            log.warning(f"TradeJudge API error: {e} — defaulting to BUY 1.0x")
-            return True, 1.0, f"LLM gate error ({e}) — proceeding", None
+            # FIX v4.2: FAIL SAFE — errors default to SKIP, not BUY
+            # A broken risk gate should never default to executing trades
+            log.warning(f"TradeJudge API error: {e} — defaulting to SKIP (fail safe)")
+            return False, 0.0, f"LLM gate error ({e}) — skipping trade (fail safe)", None
