@@ -779,6 +779,20 @@ class PositionMonitor:
         self._lock = threading.RLock()
         self._load_entry_prices()
 
+    def _past_flatten_time(self) -> bool:
+        """True once we are inside the end-of-day flatten window."""
+        if not CONFIG.get("flatten_eod", True):
+            return False
+        try:
+            hh, mm = str(CONFIG.get("close_all_by_et", "15:45")).split(":")
+            now = datetime.now(pytz.timezone("America/New_York"))
+            if now.weekday() >= 5:
+                return False
+            return (now.hour * 60 + now.minute) >= (int(hh) * 60 + int(mm)) \
+                and now.hour < 16
+        except Exception:
+            return False
+
     def _entry_prices_path(self):
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), "entry_prices.json")
 
@@ -1018,7 +1032,7 @@ class PositionMonitor:
                 # ── Skip if close order pending — wait for fill, or timeout and go market ──
                 if symbol in self.pending_close:
                     elapsed = time.time() - self.pending_close_times.get(symbol, time.time())
-                    max_wait = CONFIG.get("close_order_timeout_secs", 300)
+                    max_wait = CONFIG.get("close_order_timeout_secs", 90)
                     if elapsed < max_wait:
                         log.info(f"⏳ {symbol} — close order pending ({elapsed:.0f}s / {max_wait}s)")
                         continue
@@ -1075,10 +1089,43 @@ class PositionMonitor:
 
                 quote_resp  = self.client.get_quote(symbol)
                 quotes      = quote_resp.get("quotes", {}).get("quote", {})
-                current_bid = float(quotes.get("bid", 0))
+                current_bid = float(quotes.get("bid", 0) or 0)
+                current_ask = float(quotes.get("ask", 0) or 0)
+                last_px     = float(quotes.get("last", 0) or 0)
 
-                if entry_price <= 0 or current_bid <= 0:
+                if entry_price <= 0:
                     continue
+
+                # ── v5.6: a zero bid must NOT skip the position ──────────
+                # The old code did `if current_bid <= 0: continue`, silently
+                # and with no log line. But a bid of zero is not a missing
+                # quote — it is a dying option with no buyers, which is
+                # exactly the moment the stop loss needs to fire. The
+                # position became invisible to every exit rule while it
+                # collapsed, then got sold for scraps.
+                #
+                # This is the mechanism behind the loss tail: a configured
+                # 25% stop produced realised losses of -52%, -61%, -72%,
+                # -89% and -94% across 146 trades.
+                force_market = False
+                if current_bid <= 0:
+                    force_market = True
+                    if last_px > 0:
+                        mark, src = last_px, "last"
+                    elif current_ask > 0:
+                        # No bid at all. Half the ask is a deliberately
+                        # pessimistic stand-in — better to over-estimate the
+                        # loss and act than to under-estimate it and sit.
+                        mark, src = current_ask / 2, "half-ask"
+                    else:
+                        log.error(f"🚨 {symbol}: NO bid, ask or last — cannot "
+                                  f"price this position. CHECK MANUALLY.")
+                        continue
+                    log.warning(f"⚠️  {symbol}: bid is ZERO — pricing from "
+                                f"{src} (${mark:.2f}). Exits will use market "
+                                f"orders; a limit at the bid is meaningless "
+                                f"when there is no bid.")
+                    current_bid = mark
 
                 pnl_pct   = (current_bid - entry_price) / entry_price * 100
                 sig_score = self.entry_prices.get(symbol + "_score", 13)
@@ -1090,6 +1137,22 @@ class PositionMonitor:
                     self.peak_prices[symbol] = current_bid
 
                 peak_pnl_pct = (self.peak_prices[symbol] - entry_price) / entry_price * 100
+
+                # ── v5.6: End-of-day flatten ─────────────────────────
+                # There was no EOD close at all: the loop traded until 15:59
+                # and whatever was open rode overnight. On weekly and 0DTE
+                # options an overnight gap cannot be stopped at any price —
+                # the 25% stop never gets a chance to fire, because the move
+                # happens while the market is shut. Given the 90-minute time
+                # exit, holding overnight was never the intent anyway.
+                if self._past_flatten_time():
+                    log.info(f"🌆 EOD FLATTEN: {symbol} at "
+                             f"{CONFIG.get('close_all_by_et', '15:45')} ET "
+                             f"({pnl_pct:+.1f}%) — not carrying options "
+                             f"overnight")
+                    self._close_position(symbol, qty, current_bid,
+                                         use_market=True)
+                    continue
 
                 # ── Time-based exit ──
                 entry_time = self.entry_times.get(symbol)
@@ -1103,7 +1166,8 @@ class PositionMonitor:
                             self.time_extended.add(symbol)
                             continue
                         log.info(f"⏱️  TIME EXIT: {symbol} held {minutes_held:.0f}min ({pnl_pct:+.1f}%) | Selling {qty} contracts")
-                        self._close_position(symbol, qty, current_bid)
+                        self._close_position(symbol, qty, current_bid,
+                                             use_market=force_market)
                         continue
 
                 # Trailing stop
@@ -1120,15 +1184,18 @@ class PositionMonitor:
                             f"🔒 TRAILING STOP: {symbol} peaked at +{peak_pnl_pct:.1f}%, "
                             f"pulled back {pullback_from_peak:.1f}% (trail: {trail_pct}%) | Selling {qty} contracts"
                         )
-                        self._close_position(symbol, qty, current_bid)
+                        self._close_position(symbol, qty, current_bid,
+                                             use_market=force_market)
                         continue
 
                 if pnl_pct >= tp_pct:
                     log.info(f"✅ TAKE PROFIT: {symbol} +{pnl_pct:.1f}% (threshold: +{tp_pct}%) | Selling {qty} contracts")
-                    self._close_position(symbol, qty, current_bid)
+                    self._close_position(symbol, qty, current_bid,
+                                         use_market=force_market)
                 elif pnl_pct <= -sl_pct:
                     log.info(f"🛑 STOP LOSS: {symbol} {pnl_pct:.1f}% (threshold: -{sl_pct}%) | Selling {qty} contracts")
-                    self._close_position(symbol, qty, current_bid)
+                    self._close_position(symbol, qty, current_bid,
+                                         use_market=force_market)
                 else:
                     trail_info = f" | Peak: +{peak_pnl_pct:.1f}%" if peak_pnl_pct > 5 else ""
                     time_info = f" | Held: {int((datetime.now() - entry_time).total_seconds() / 60)}min" if entry_time else ""
@@ -1140,18 +1207,25 @@ class PositionMonitor:
         except Exception as e:
             log.error(f"Position monitor error: {e}")
 
-    def _close_position(self, option_symbol: str, qty: int, bid: float):
+    def _close_position(self, option_symbol: str, qty: int, bid: float,
+                        use_market: bool = False):
         m = re.match(r'^([A-Z]+)', option_symbol)
         ticker = m.group(1) if m else option_symbol[:6]
         try:
-            result = self.client.place_order(
-                symbol=ticker,
-                option_symbol=option_symbol,
-                side="sell_to_close",
-                quantity=qty,
-                order_type="limit",
-                price=round(bid * 0.98, 2)
-            )
+            if use_market or bid <= 0.05:
+                # No bid, or a bid so small a limit is pointless. Get out.
+                result = self.client.place_order(
+                    symbol=ticker, option_symbol=option_symbol,
+                    side="sell_to_close", quantity=qty, order_type="market")
+            else:
+                result = self.client.place_order(
+                    symbol=ticker,
+                    option_symbol=option_symbol,
+                    side="sell_to_close",
+                    quantity=qty,
+                    order_type="limit",
+                    price=round(bid * 0.98, 2)
+                )
             entry_price = self.entry_prices.get(option_symbol, bid)
             pnl_per_contract = (bid - entry_price) * 100
             total_pnl = pnl_per_contract * qty

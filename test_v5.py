@@ -680,8 +680,14 @@ class FakeTradier:
         return {"SPYLONG": {"bid": self.long_bid, "ask": self.long_bid + 0.2},
                 "SPYSHORT": {"bid": self.short_ask - 0.05, "ask": self.short_ask}}
 
+    quote_bid = None      # None → use long_bid
+    quote_ask = 1.0
+    quote_last = 0.90
+
     def get_quote(self, symbol):
-        return {"quotes": {"quote": {"bid": self.long_bid}}}
+        bid = self.long_bid if self.quote_bid is None else self.quote_bid
+        return {"quotes": {"quote": {"bid": bid, "ask": self.quote_ask,
+                                     "last": self.quote_last}}}
 
     def place_multileg_order(self, payload):
         with self._lock:
@@ -773,6 +779,78 @@ def test_monitor():
                     and o.get("class") == "multileg"]
     check("6 threads x 4 passes → exactly ONE close order",
           len(close_orders) == 1, f"got {len(close_orders)}")
+
+
+# ── 13. Exit-path leaks (v5.6 regression) ──────────────────────────────────────
+def test_exit_leaks():
+    print("\n[13] Exit-path leaks (v5.6 regression)")
+    import agent as ag
+    from config import CONFIG
+
+    def monitor(bid, quote_bid=None):
+        m = ag.PositionMonitor.__new__(ag.PositionMonitor)
+        m.client = FakeTradier(long_bid=bid)
+        m.client.quote_bid = quote_bid
+        m.client.get_positions = lambda: {"positions": {"position": [
+            {"symbol": "AAPL260429C00272500", "quantity": 1,
+             "cost_basis": 88.0}]}}
+        m.entry_prices, m.peak_prices, m.entry_times = {}, {}, {}
+        m.recently_closed, m.pending_close = set(), set()
+        m.pending_close_times, m.pending_close_order_ids = {}, {}
+        m.daily_realized_pnl, m.time_extended = 0.0, set()
+        m.spread_positions = {}
+        m._lock = threading.RLock()
+        m._save_entry_prices = lambda: None
+        m._write_trade_result = lambda *a, **k: None
+        return m
+
+    # A dying option: entry $0.88, bid collapsed to 0, last $0.20 → -77%.
+    # Old code hit `if current_bid <= 0: continue` and never evaluated it.
+    m = monitor(bid=0.0, quote_bid=0.0)
+    m.client.quote_last = 0.20
+    m.client.quote_ask = 0.30
+    m._check_and_exit_impl()
+    sells = [o for o in m.client.orders if isinstance(o, dict)
+             and o.get("side") == "sell_to_close"]
+    check("ZERO bid no longer skips the stop loss", len(sells) == 1,
+          f"orders={m.client.orders}")
+    if sells:
+        check("zero-bid exit uses a MARKET order (a limit at the bid is "
+              "meaningless)", sells[0].get("order_type") == "market")
+
+    # Healthy bid, small loss → hold
+    m = monitor(bid=0.80)
+    m._check_and_exit_impl()
+    check("healthy bid, small loss → still held",
+          not [o for o in m.client.orders if isinstance(o, dict)])
+
+    # No bid, no ask, no last → cannot price; must not invent a number
+    m = monitor(bid=0.0, quote_bid=0.0)
+    m.client.quote_last = 0.0
+    m.client.quote_ask = 0.0
+    m._check_and_exit_impl()
+    check("unpriceable position is flagged, not silently traded",
+          not [o for o in m.client.orders if isinstance(o, dict)])
+
+    # ── EOD flatten ──
+    orig_flat, orig_time = CONFIG.get("flatten_eod"), CONFIG.get("close_all_by_et")
+    m = monitor(bid=0.80)
+    CONFIG["flatten_eod"] = True
+    CONFIG["close_all_by_et"] = "00:01"      # everything is "past" this
+    check("flatten window detected", m._past_flatten_time() is True)
+    m._check_and_exit_impl()
+    check("EOD flatten closes an otherwise-held position",
+          len([o for o in m.client.orders if isinstance(o, dict)]) == 1)
+
+    m2 = monitor(bid=0.80)
+    CONFIG["close_all_by_et"] = "23:59"      # nothing is past this
+    check("outside the window, positions are left alone",
+          m2._past_flatten_time() is False)
+
+    CONFIG["flatten_eod"] = False
+    check("flatten can be disabled", m2._past_flatten_time() is False)
+    CONFIG["flatten_eod"] = orig_flat if orig_flat is not None else True
+    CONFIG["close_all_by_et"] = orig_time or "15:45"
 
 
 # ── 7. Config integrity ────────────────────────────────────────────────────────
@@ -981,6 +1059,7 @@ if __name__ == "__main__":
     test_async_layer()
     test_tradier_data()
     test_monitor()
+    test_exit_leaks()
     test_config()
     test_end_to_end()
     test_deep_itm()
