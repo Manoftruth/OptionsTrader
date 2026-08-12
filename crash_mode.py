@@ -61,7 +61,17 @@ import pandas as pd
 log = logging.getLogger("OptionsAgent")
 
 # Tickers the detector needs. Fetched concurrently in one batch.
-REGIME_TICKERS = ["SPY", "^VIX", "^VIX3M", "HYG", "IEF", "^TNX", "^IRX", "QQQ", "IWM"]
+REGIME_TICKERS = ["SPY", "^VIX", "^VIX3M", "HYG", "IEF", "QQQ", "IWM"]
+
+# v5.4: the yield curve is OFF by default.
+#
+# It was only ever macro context — it never casts a crash vote, because an
+# inverted curve leads recessions by 6-24 months and has no timing value for a
+# weekly option. In production both symbols were also returning nothing from
+# Yahoo (which is what produced the nonsensical "-757.15pp" reading), while
+# still costing ~9s each under throttling: ~18 seconds per cycle for a log line
+# that cannot influence a trade. Enable with cfg["fetch_yield_curve"]=True.
+CURVE_TICKERS = ["^TNX", "^IRX"]
 
 DEFAULTS: dict[str, Any] = {
     # crash classification
@@ -81,6 +91,8 @@ DEFAULTS: dict[str, Any] = {
     "vix_floor":              5.0,
     "vix_ceiling":            150.0,
     "spy_floor":              50.0,
+    # macro context only — never gates a trade. See CURVE_TICKERS.
+    "fetch_yield_curve":      False,
     # spreads
     "spread_iv_threshold":    22.0,   # VIX above this → prefer debit spreads
 }
@@ -342,10 +354,15 @@ async def assess(md, cfg: dict | None = None) -> RegimeReport:
 
     ``md`` is an open ``AsyncMarketData``.
     """
-    reqs = [(t, "1d", "1y") for t in REGIME_TICKERS]
+    conf = {**DEFAULTS, **(cfg or {})}
+    tickers = list(REGIME_TICKERS)
+    if conf.get("fetch_yield_curve", False):
+        tickers += CURVE_TICKERS
+
+    reqs = [(t, "1d", "1y") for t in tickers]
     frames_by_req = await md.get_many_bars(reqs)
     frames = {t: frames_by_req.get((t, "1d", "1y"), pd.DataFrame())
-              for t in REGIME_TICKERS}
+              for t in tickers}
 
     # Spot VIX from a 5m bar is fresher than the daily close mid-session.
     try:

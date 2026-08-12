@@ -144,6 +144,20 @@ class TradierClient:
     def get_orders(self):
         return self._get(f"/accounts/{CONFIG['account_id']}/orders")
 
+    def get_order(self, order_id) -> dict:
+        """Single order detail — includes status and reason_description.
+
+        Submission is not execution. Tradier returns {'status':'ok'} with an
+        order id for anything it accepts into the queue; the order can still be
+        rejected a second later by the risk layer. This is how you find out.
+        """
+        try:
+            resp = self._get(f"/accounts/{CONFIG['account_id']}/orders/{order_id}")
+            return (resp or {}).get("order", {}) or {}
+        except Exception as e:
+            log.warning(f"Could not fetch order {order_id}: {e}")
+            return {}
+
 
 # ── VIX / SPY Market Filters ───────────────────────────────────────────────────
 def get_vix() -> float:
@@ -1267,6 +1281,7 @@ class OptionsAgent:
             max_concurrency=int(CONFIG.get("scan_concurrency", 8)),
             timeout_secs=float(CONFIG.get("scan_timeout_secs", 12.0)),
             cache_ttl=float(CONFIG.get("scan_cache_ttl", 45.0)),
+            daily_cache_ttl=float(CONFIG.get("daily_cache_ttl", 1800.0)),
             tradier=td,
         )
         await md.open()
@@ -1609,13 +1624,42 @@ class OptionsAgent:
                         order_type="market",
                     )
             else:
+                # v5.5: LIMIT, not market.
+                #
+                # Tradier rejects market orders on options whenever it cannot
+                # establish a quote at that instant — "There is no price.
+                # Security symbol: ...". Observed live on SQQQ260814C00036000
+                # while the chain was quoting $1.38. Exits here have always
+                # used limit orders; entries were the inconsistency.
+                #
+                # It is also simply better execution. A market order on an
+                # option with a wide spread fills wherever the book happens to
+                # be, which on a 3x ETF in a selloff is nowhere good.
+                pad = 1.0 + float(CONFIG.get("entry_limit_pad_pct", 3.0)) / 100.0
+                limit_px = round(trade["ask"] * pad, 2)
+                log.info(f"📐 Limit buy @ ${limit_px:.2f} "
+                         f"(ask ${trade['ask']:.2f} + "
+                         f"{CONFIG.get('entry_limit_pad_pct', 3.0)}%)")
                 result = self.client.place_order(
                     symbol=trade["ticker"],
                     option_symbol=trade["option_symbol"],
                     side="buy_to_open",
                     quantity=trade["contracts"],
-                    order_type="market"
+                    order_type="limit",
+                    price=limit_px,
                 )
+
+            # ── Confirm the order actually lives ──────────────────────────
+            # Without this the agent records an entry, writes trades.json and
+            # sets a cooldown for a position it does not own.
+            order_id = str((result or {}).get("order", {}).get("id", ""))
+            filled, why = self._await_fill(order_id)
+            if not filled:
+                log.error(f"❌ ORDER DID NOT FILL: {why}")
+                log.error("   No entry recorded. The agent owns nothing from "
+                          "this cycle.")
+                return
+
             score = best_signal.get("score", 13)
             # Merge sl_hint from signal engine into tp_sl_override if TradeJudge didn't set SL
             # Deep ITM moves differently from an OTM lottery ticket: high delta
@@ -1654,6 +1698,46 @@ class OptionsAgent:
 
         except Exception as e:
             log.error(f"Order execution failed: {e}")
+
+    def _await_fill(self, order_id: str, timeout: float = None) -> tuple[bool, str]:
+        """Poll Tradier until the order fills, is rejected, or we give up.
+
+        Returns (filled, explanation). A partial fill counts as filled — the
+        position monitor sizes from the broker's quantity, not ours.
+        """
+        if not order_id:
+            return False, "no order id returned by Tradier"
+        timeout = timeout or float(CONFIG.get("fill_timeout_secs", 45))
+        deadline = time.time() + timeout
+        last = "unknown"
+
+        while time.time() < deadline:
+            o = self.client.get_order(order_id)
+            status = (o.get("status") or "").lower()
+            last = status or last
+
+            if status == "filled":
+                px = o.get("avg_fill_price")
+                log.info(f"✅ FILLED {o.get('exec_quantity')} @ ${px}")
+                return True, "filled"
+            if status in ("rejected", "canceled", "expired", "error"):
+                reason = o.get("reason_description") or "no reason given"
+                return False, f"{status.upper()} — {reason}"
+            if status == "partially_filled":
+                log.info(f"◐ Partial fill: {o.get('exec_quantity')}/"
+                         f"{o.get('quantity')}")
+                return True, "partially filled"
+            time.sleep(2)
+
+        # Still working at the deadline. Cancel rather than leave a resting
+        # order that could fill minutes later into a market we no longer read.
+        log.warning(f"⏱️  Order {order_id} unfilled after {timeout:.0f}s "
+                    f"(status: {last}) — cancelling")
+        try:
+            self.client.cancel_order(order_id)
+        except Exception as e:
+            log.error(f"   Cancel failed: {e} — CHECK TRADIER MANUALLY")
+        return False, f"timed out unfilled after {timeout:.0f}s"
 
     def _write_daily_summary(self):
         eastern = pytz.timezone("America/New_York")

@@ -345,6 +345,33 @@ def test_deep_itm_routing():
           all(o.get("symbol") not in ("SQQQ", "SPXS")
               for o in b3.orders if isinstance(o, dict)), f"orders={b3.orders}")
 
+    # ── v5.5 regression: a rejected order must not be recorded as a position ──
+    # Live incident 2026-08-12: Tradier accepted the submission ({'status':
+    # 'ok'}, order id issued) then rejected it — "There is no price". The agent
+    # had already recorded the entry, written trades.json and set a cooldown
+    # for a position it did not own.
+    b6 = FakeBroker()
+    b6.etf_dte = 1
+    b6.order_status = "rejected"
+    a6 = _cycle((rep, ov, [sig]), b6)
+    check("REJECTED order records no entry",
+          not any(k for k in a6.monitor.entry_prices if not k.endswith(
+              ("_score", "_time", "_tp", "_sl"))),
+          f"entry_prices={a6.monitor.entry_prices}")
+    check("REJECTED order logs no trade", len(a6.trades_today) == 0)
+
+    # And entries must be LIMIT orders now, not market
+    b7 = FakeBroker()
+    b7.etf_dte = 1
+    _cycle((rep, ov, [sig]), b7)
+    entry = [o for o in b7.orders if isinstance(o, dict)
+             and o.get("side") == "buy_to_open"]
+    check("entry is a LIMIT order, not market",
+          bool(entry) and entry[0].get("order_type") == "limit",
+          str(entry[:1]))
+    check("limit price sits at or above the ask",
+          bool(entry) and entry[0].get("price", 0) > 0, str(entry[:1]))
+
 
 def test_spreads():
     print("\n[4] Spread construction")
@@ -423,6 +450,10 @@ def test_async_layer():
         return
 
     import async_data
+    # v5.4 made the bar cache module-level so it survives the agent's per-cycle
+    # rebuild. That also means it survives between tests — clear it, or one
+    # section's fixtures silently answer another section's requests.
+    async_data._SHARED_CACHE.clear()
 
     hits = {"n": 0}
 
@@ -533,6 +564,7 @@ def test_tradier_data():
 
     import tradier_data as tdmod
     import async_data
+    async_data._SHARED_CACHE.clear()
 
     seen = {"history": 0, "timesales": 0}
 
@@ -661,6 +693,22 @@ class FakeTradier:
         with self._lock:
             self.orders.append(kw)
         return {"order": {"id": len(self.orders)}}
+
+    # v5.5: the agent now confirms fills rather than assuming submission ==
+    # execution. order_status lets a test simulate a broker rejection.
+    order_status = "filled"
+    reject_reason = "There is no price. Security symbol: TEST"
+
+    def get_order(self, order_id):
+        if self.order_status == "filled":
+            return {"id": order_id, "status": "filled", "avg_fill_price": 1.38,
+                    "exec_quantity": 1, "quantity": 1}
+        return {"id": order_id, "status": self.order_status,
+                "reason_description": self.reject_reason,
+                "exec_quantity": 0, "quantity": 1}
+
+    def cancel_order(self, order_id):
+        return {"order": {"id": order_id, "status": "canceled"}}
 
 
 def test_monitor():

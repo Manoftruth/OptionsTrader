@@ -79,12 +79,31 @@ _CHART_HOSTS = ("https://query2.finance.yahoo.com", "https://query1.finance.yaho
 # The fallback is now serialised behind this lock. Slower, correct.
 _YF_LOCK = threading.Lock()
 
+# ── Cross-cycle cache ─────────────────────────────────────────────────────────
+# v5.4. The agent builds a NEW AsyncMarketData every cycle, because each cycle
+# runs its own asyncio.run() and an aiohttp session cannot outlive its event
+# loop. A per-instance cache therefore died every 200 seconds and cached
+# nothing useful.
+#
+# This cache is module-level, so it survives instance churn. Only parsed
+# DataFrames live here — never sessions or sockets, which are loop-bound.
+#
+# The win is in the interval. Daily bars over a year change ONCE PER DAY, but
+# the regime detector was re-fetching SPY/HYG/IEF/^VIX/^VIX3M every cycle at
+# ~9s each under Yahoo throttling — about 29 of the 38 seconds a cycle took.
+_SHARED_CACHE: dict[str, tuple[float, Any]] = {}
+_CACHE_LOCK = threading.Lock()
+
+# Intervals whose bars only change once a session close.
+_DAILY_INTERVALS = {"1d", "1wk", "1mo", "5d"}
+
 
 class AsyncMarketData:
     """Concurrent market data fetcher with a synchronous convenience wrapper."""
 
     def __init__(self, max_concurrency: int = 8, timeout_secs: float = 12.0,
-                 cache_ttl: float = 45.0, tradier=None):
+                 cache_ttl: float = 45.0, tradier=None,
+                 daily_cache_ttl: float = 1800.0):
         # v5.3: optional TradierData instance. When present it is tried FIRST
         # for every symbol, with Yahoo kept as a per-symbol fallback. Tradier
         # is authenticated and does not throttle data-center IPs, which is what
@@ -95,13 +114,14 @@ class AsyncMarketData:
         self.max_concurrency = max_concurrency
         self.timeout_secs = timeout_secs
         self.cache_ttl = cache_ttl
+        # Daily bars get a much longer TTL — see the _SHARED_CACHE note above.
+        self.daily_cache_ttl = daily_cache_ttl
         self._session: "aiohttp.ClientSession | None" = None
         self._sem: asyncio.Semaphore | None = None
         self._crumb: str | None = None
         self._crumb_fetched_at: float = 0.0
-        # (key) -> (timestamp, value). Guards against re-fetching SPY five
-        # times in one cycle because five different code paths want it.
-        self._cache: dict[str, tuple[float, Any]] = {}
+        # Shared across instances so it survives the per-cycle rebuild.
+        self._cache = _SHARED_CACHE
 
     # ── session lifecycle ──────────────────────────────────────────────────
 
@@ -190,17 +210,25 @@ class AsyncMarketData:
 
     # ── cache ──────────────────────────────────────────────────────────────
 
-    def _cache_get(self, key: str):
-        hit = self._cache.get(key)
-        if hit and (time.time() - hit[0]) < self.cache_ttl:
+    def _ttl_for(self, interval: str | None) -> float:
+        if interval and interval in _DAILY_INTERVALS:
+            return self.daily_cache_ttl
+        return self.cache_ttl
+
+    def _cache_get(self, key: str, interval: str | None = None):
+        with _CACHE_LOCK:
+            hit = self._cache.get(key)
+        if hit and (time.time() - hit[0]) < self._ttl_for(interval):
             return hit[1]
         return None
 
     def _cache_put(self, key: str, value) -> None:
-        self._cache[key] = (time.time(), value)
+        with _CACHE_LOCK:
+            self._cache[key] = (time.time(), value)
 
     def clear_cache(self) -> None:
-        self._cache.clear()
+        with _CACHE_LOCK:
+            self._cache.clear()
 
     # ── bars ───────────────────────────────────────────────────────────────
 
@@ -256,8 +284,9 @@ class AsyncMarketData:
     async def get_bars(self, ticker: str, interval: str, period: str) -> pd.DataFrame:
         """Concurrent replacement for ``yf.download(ticker, interval, period)``."""
         key = f"bars:{ticker}:{interval}:{period}"
-        cached = self._cache_get(key)
+        cached = self._cache_get(key, interval)
         if cached is not None:
+            self.source_log[f"{ticker}:{interval}"] = "cache"
             return cached
 
         # ── Tradier first ──────────────────────────────────────────────────
