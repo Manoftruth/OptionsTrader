@@ -56,6 +56,16 @@ log = logging.getLogger("OptionsAgent")
 FULL_WATCHLIST    = ["SPY", "QQQ", "TSLA", "NVDA", "AMD", "META", "AMZN", "MSFT", "AAPL"]
 NEUTRAL_WATCHLIST = ["SPY", "QQQ"]
 
+# ETFs have no earnings date, so the blackout check is a wasted network call.
+EARNINGS_EXEMPT = {"SPY", "QQQ", "IWM", "DIA", "TQQQ", "QLD", "SOXL", "SPXL",
+                   "LABU", "SQQQ", "SPXS", "SOXS", "UVXY", "VXX", "XLK", "XLF",
+                   "XLE", "HYG", "IEF", "GLD", "TLT"}
+
+# Extra names that only make sense when the tape is broken. Index puts and
+# volatility products carry the deepest liquidity in a selloff, which is
+# exactly when single-name option spreads become untradeable.
+CRASH_WATCHLIST = ["SPY", "QQQ", "IWM", "DIA", "TLT", "XLF", "SMH"]
+
 ET = pytz.timezone("America/New_York")
 
 
@@ -161,6 +171,9 @@ class SignalEngine:
         Signal fires when:
         1. Volume/OI ratio > 3x on ATM strikes (aggressive buying today)
         2. Directional skew: call vol vs put vol > 1.5x in one direction
+
+        v5: the parsing half now lives in _uvol_from_frames so the async scan
+        path can reuse it with a pre-fetched chain instead of re-downloading.
         """
         try:
             tk = yf.Ticker(ticker)
@@ -170,8 +183,22 @@ class SignalEngine:
 
             exp = expirations[0]  # nearest expiry
             chain = tk.option_chain(exp)
-            calls = chain.calls.copy()
-            puts  = chain.puts.copy()
+            return self._uvol_from_frames(chain.calls, chain.puts, price)
+        except Exception as e:
+            log.warning(f"Options volume detect error {ticker}: {e}")
+            return {"detected": False}
+
+    def _uvol_from_frames(self, calls_df, puts_df, price: float) -> dict:
+        """Pure form of the unusual-options-volume detector — no network calls."""
+        try:
+            if calls_df is None or puts_df is None or price <= 0:
+                return {"detected": False}
+            calls = calls_df.copy()
+            puts  = puts_df.copy()
+            for frame in (calls, puts):
+                for col in ("volume", "openInterest", "strike"):
+                    if col not in frame.columns:
+                        frame[col] = 0.0
 
             calls["volume"]       = calls["volume"].fillna(0)
             calls["openInterest"] = calls["openInterest"].fillna(0)
@@ -242,7 +269,7 @@ class SignalEngine:
             }
 
         except Exception as e:
-            log.warning(f"Options volume detect error {ticker}: {e}")
+            log.warning(f"Options volume parse error: {e}")
             return {"detected": False}
 
     # ── Squeeze detection (Gate 2B) ────────────────────────────────────────────
@@ -336,7 +363,17 @@ class SignalEngine:
             return 0, []
 
     # ── VIX-based size multiplier ──────────────────────────────────────────────
-    def _vix_size_multiplier(self, vix: float) -> float:
+    def _vix_size_multiplier(self, vix: float, crash_mode: bool = False) -> float:
+        """
+        Position size as a function of implied volatility.
+
+        v5 change: the old ladder returned 0.0x above VIX 30, which meant the
+        agent sized every position to zero in precisely the tape it is now
+        meant to trade. In crash mode the ladder floors at 0.35x instead —
+        small, but non-zero. Outside crash mode the original behaviour is
+        unchanged, because buying options at VIX 40 with no regime
+        confirmation is just donating premium.
+        """
         if vix < 15:
             return 1.0
         elif vix < 20:
@@ -345,6 +382,10 @@ class SignalEngine:
             return 0.70
         elif vix < 30:
             return 0.50
+        elif crash_mode:
+            # Vol this high means wide spreads and violent two-way moves.
+            # Stay in the game, but at a fraction of normal size.
+            return 0.45 if vix < 40 else 0.35
         else:
             return 0.0
 
@@ -463,12 +504,63 @@ class SignalEngine:
 
     # ── Main scoring function ──────────────────────────────────────────────────
     def score_ticker(self, ticker: str, regime: str = "neutral",
-                     vix: float = 20.0) -> dict | None:
+                     vix: float = 20.0, overrides: dict | None = None) -> dict | None:
+        """Synchronous path — fetches its own data, then defers to score_core.
+
+        Kept for the standalone test harness and as the fallback if the async
+        data layer is unavailable. The scoring logic itself is NOT duplicated:
+        both paths call score_core, so there is exactly one place where a
+        trading decision is made.
+        """
         try:
             df_1h  = self._fetch(ticker, "1h",  "3mo")
             df_15m = self._fetch(ticker, "15m", "5d")
             df_5m  = self._fetch(ticker, "5m",  "2d")
 
+            earnings_soon = (
+                ticker not in EARNINGS_EXEMPT
+                and self._has_earnings_soon(ticker, days=2)
+            )
+
+            calls_df = puts_df = None
+            try:
+                tk = yf.Ticker(ticker)
+                if tk.options:
+                    ch = tk.option_chain(tk.options[0])
+                    calls_df, puts_df = ch.calls, ch.puts
+            except Exception:
+                pass
+
+            return self.score_core(
+                ticker, df_1h, df_15m, df_5m,
+                calls_df=calls_df, puts_df=puts_df,
+                earnings_soon=earnings_soon,
+                regime=regime, vix=vix, overrides=overrides,
+            )
+        except Exception as e:
+            import traceback
+            log.warning(f"Signal error {ticker}: {e}\n{traceback.format_exc()}")
+            return None
+
+    def score_core(self, ticker: str, df_1h, df_15m, df_5m,
+                   calls_df=None, puts_df=None, earnings_soon: bool = False,
+                   regime: str = "neutral", vix: float = 20.0,
+                   overrides: dict | None = None,
+                   spy_5m=None) -> dict | None:
+        """The single scoring implementation. Pure — takes data, returns a signal.
+
+        ``overrides`` comes from crash_mode.overrides_for() and may contain:
+          allow_calls / allow_puts  — hard direction gates
+          max_atr_pct               — volatility ceiling (default 5.0)
+          crash_mode                — relaxes the VIX size floor
+        """
+        ov = overrides or {}
+        crash_mode  = bool(ov.get("crash_mode"))
+        allow_calls = ov.get("allow_calls", True)
+        allow_puts  = ov.get("allow_puts", True)
+        max_atr_pct = float(ov.get("max_atr_pct", 5.0))
+
+        try:
             if df_1h is None or df_15m is None or df_5m is None:
                 return None
             if df_1h.empty or df_15m.empty or df_5m.empty:
@@ -477,7 +569,7 @@ class SignalEngine:
             price_1h = self._scalar(df_1h["Close"].iloc[-1])
 
             # ── GATE 4: Earnings blackout ──────────────────────────────────────
-            if ticker not in ("SPY", "QQQ", "TQQQ", "QLD", "SOXL", "SPXL", "LABU") and self._has_earnings_soon(ticker, days=2):
+            if ticker not in EARNINGS_EXEMPT and earnings_soon:
                 log.info(f"  ⬜ {ticker}: EARNINGS BLACKOUT — skipping")
                 return None
 
@@ -500,9 +592,23 @@ class SignalEngine:
                 log.info(f"  ⬜ {ticker}: confluence FAILED ({call_tfs}C/{put_tfs}P) — need 3/3")
                 return None
 
+            # ── GATE 1b: Direction gate from the regime overrides ─────────────
+            # In a crash this is what stops the agent from buying calls into a
+            # falling knife because three timeframes all agree on a dead-cat
+            # bounce.
+            if final_direction == "CALL" and not allow_calls:
+                log.info(f"  ⬜ {ticker}: CALLs blocked by {regime.upper()} regime")
+                return None
+            if final_direction == "PUT" and not allow_puts:
+                log.info(f"  ⬜ {ticker}: PUTs blocked by {regime.upper()} regime")
+                return None
+
             # ── GATE 2: Entry qualifier ────────────────────────────────────────
             squeeze  = self._detect_squeeze(df_1h)
-            uvol     = self._detect_unusual_options_volume(ticker, price_1h)
+            if calls_df is not None and puts_df is not None:
+                uvol = self._uvol_from_frames(calls_df, puts_df, price_1h)
+            else:
+                uvol = self._detect_unusual_options_volume(ticker, price_1h)
 
             has_squeeze = squeeze["breakout"] and squeeze["strength"] > 0.3
             has_uvol    = uvol["detected"] and uvol.get("direction") == final_direction
@@ -543,7 +649,7 @@ class SignalEngine:
                 bonus_reasons.insert(0, f"✅ Regime ({regime.upper()}) aligned with {final_direction}")
             bonus_score += regime_score
 
-            spy_5m_for_trend = df_5m if ticker == "SPY" else None
+            spy_5m_for_trend = df_5m if ticker == "SPY" else spy_5m
             trend_bonus, trend_reasons = self._intraday_trend_bonus(final_direction, vix, spy_5m_for_trend)
             bonus_score  += trend_bonus
             bonus_reasons.extend(trend_reasons)
@@ -551,19 +657,25 @@ class SignalEngine:
             total_score = round(tech_score + bonus_score, 1)
 
             # Volatility sanity check
+            # v5: ceiling is configurable. The hard-coded 5% rejected every
+            # ticker once realised volatility expanded — i.e. it switched the
+            # agent off at the start of every selloff. Crash mode raises it to
+            # ~12% and relies on the per-leg bid/ask spread check in the
+            # contract selector to catch genuinely untradeable strikes.
             atr_val = self._atr(df_1h)
             vol_pct = (atr_val / price_1h * 100) if price_1h > 0 else 0
-            if vol_pct > 5.0:
-                log.info(f"  ⬜ {ticker}: ATR too high ({vol_pct:.1f}%) — spreads too wide")
+            if vol_pct > max_atr_pct:
+                log.info(f"  ⬜ {ticker}: ATR too high ({vol_pct:.1f}% > {max_atr_pct}%) — spreads too wide")
                 return None
 
-            vix_mult = self._vix_size_multiplier(vix)
+            vix_mult = self._vix_size_multiplier(vix, crash_mode=crash_mode)
 
             try:
-                tk    = yf.Ticker(ticker)
-                exp   = tk.options[0]
-                chain = tk.option_chain(exp)
-                side  = chain.calls if final_direction == "CALL" else chain.puts
+                side = calls_df if final_direction == "CALL" else puts_df
+                if side is None:
+                    tk    = yf.Ticker(ticker)
+                    chain = tk.option_chain(tk.options[0])
+                    side  = chain.calls if final_direction == "CALL" else chain.puts
                 atm   = side.iloc[(side["strike"] - price_1h).abs().argsort()[:1]]
                 est_ask = float(atm["ask"].iloc[0]) if not atm.empty else 0.50
             except Exception:
@@ -586,6 +698,10 @@ class SignalEngine:
                 "uvol_bonus":       uvol_bonus,
                 "vix_size_mult":    vix_mult,
                 "sl_hint":          sl_pct,
+                "atr":              round(atr_val, 3),
+                "est_ask":          round(est_ask, 2),
+                "regime":           regime,
+                "crash_mode":       crash_mode,
                 "timeframe_scores": {
                     "1h":  s1h["score"],
                     "15m": s15m["score"],
@@ -650,6 +766,95 @@ class SignalEngine:
 
         signals.sort(key=lambda x: x["score"], reverse=True)
         return signals
+
+    # ── Async scan (v5) ────────────────────────────────────────────────────────
+    async def get_top_signals_async(self, md, min_score: float,
+                                    regime: str = "neutral", vix: float = 20.0,
+                                    overrides: dict | None = None,
+                                    watchlist: list | None = None) -> list:
+        """Concurrent replacement for get_top_signals.
+
+        Every network call for the whole watchlist is issued at once — three
+        bar series, an option chain and an earnings check per ticker — then
+        scoring runs locally against the results. Scoring is pure CPU on small
+        DataFrames (single-digit milliseconds per ticker), so there is nothing
+        to gain from parallelising it and a GIL fight to lose.
+
+        Falls back to the synchronous path if the data layer returns nothing,
+        so a Yahoo outage degrades speed rather than blinding the agent.
+        """
+        import asyncio
+
+        ov = overrides or {}
+        if watchlist is None:
+            if regime == "crash":
+                watchlist = list(dict.fromkeys(CRASH_WATCHLIST + NEUTRAL_WATCHLIST))
+            elif regime == "neutral":
+                watchlist = NEUTRAL_WATCHLIST
+            else:
+                watchlist = FULL_WATCHLIST
+
+        log.info(f"⚡ Async scan — {len(watchlist)} tickers, "
+                 f"{len(watchlist) * 5} requests in flight")
+
+        bar_reqs = [(t, iv, pd_) for t in watchlist
+                    for iv, pd_ in (("1h", "3mo"), ("15m", "5d"), ("5m", "2d"))]
+
+        bars_task = md.get_many_bars(bar_reqs)
+        chain_tasks = [md.get_option_chain(t) for t in watchlist]
+        earn_tasks = [
+            md.has_earnings_within(t, 2) if t not in EARNINGS_EXEMPT
+            else _already_false()
+            for t in watchlist
+        ]
+
+        bars, chains, earnings = await asyncio.gather(
+            bars_task,
+            asyncio.gather(*chain_tasks, return_exceptions=True),
+            asyncio.gather(*earn_tasks, return_exceptions=True),
+        )
+
+        spy_5m = bars.get(("SPY", "5m", "2d"))
+
+        signals = []
+        for idx, ticker in enumerate(watchlist):
+            df_1h  = bars.get((ticker, "1h",  "3mo"))
+            df_15m = bars.get((ticker, "15m", "5d"))
+            df_5m  = bars.get((ticker, "5m",  "2d"))
+
+            chain = chains[idx] if not isinstance(chains[idx], Exception) else {}
+            calls_df = chain.get("calls") if isinstance(chain, dict) else None
+            puts_df  = chain.get("puts")  if isinstance(chain, dict) else None
+
+            earn = earnings[idx]
+            earn = bool(earn) if not isinstance(earn, Exception) else False
+
+            sig = self.score_core(
+                ticker, df_1h, df_15m, df_5m,
+                calls_df=calls_df, puts_df=puts_df, earnings_soon=earn,
+                regime=regime, vix=vix, overrides=ov, spy_5m=spy_5m,
+            )
+            if sig is None:
+                continue
+            if sig["score"] < min_score:
+                log.info(f"  ⬜ {ticker}: score={sig['score']:.1f} below threshold {min_score}")
+                continue
+
+            signals.append(sig)
+            log.info(
+                f"  ✅ {ticker}: score={sig['score']} dir={sig['direction']} "
+                f"squeeze={sig['has_squeeze']} uvol={sig['has_uvol']} "
+                f"vix_mult={sig['vix_size_mult']:.2f}x sl={sig['sl_hint']}% "
+                f"atr={sig['atr']} tf={sig['timeframe_scores']}"
+            )
+
+        signals.sort(key=lambda x: x["score"], reverse=True)
+        return signals
+
+
+async def _already_false() -> bool:
+    """Placeholder coroutine so gather() indices stay aligned with the watchlist."""
+    return False
 
 
 # ── Standalone test ────────────────────────────────────────────────────────────

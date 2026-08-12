@@ -1,0 +1,36 @@
+[Unit]
+Description=OptionsTrader autonomous options agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__APP_DIR__
+ExecStart=__APP_DIR__/venv/bin/python -u __APP_DIR__/agent.py
+
+# Restart on crash, but rate-limit it. Without StartLimit an agent that dies
+# instantly on a bad config would restart forever, and every restart calls
+# Tradier — a fast way to get rate limited or, worse, to re-enter positions.
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Give in-flight orders a chance to settle before SIGKILL.
+KillSignal=SIGINT
+TimeoutStopSec=60
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=optionstrader
+
+# Modest hardening. The agent only needs its own directory and outbound HTTPS.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=__APP_DIR__
+
+[Install]
+WantedBy=multi-user.target

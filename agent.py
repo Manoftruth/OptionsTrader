@@ -25,7 +25,9 @@ import os
 import re
 import time
 import json
+import asyncio
 import logging
+import threading
 import requests
 import yfinance as yf
 import pandas as pd
@@ -35,6 +37,13 @@ from pathlib import Path
 from typing import Optional
 from config import CONFIG
 from signal_engine import SignalEngine
+
+# ── v5 modules ─────────────────────────────────────────────────────────────────
+import crash_mode
+import deep_itm
+import spreads as spreads_mod
+from async_data import AsyncMarketData, AIOHTTP_AVAILABLE
+from tradier_data import TradierData
 import pytz
 
 class EasternFormatter(logging.Formatter):
@@ -106,6 +115,26 @@ class TradierClient:
             data["price"] = str(round(price, 2))
         return self._post(f"/accounts/{CONFIG['account_id']}/orders", data)
 
+    def place_multileg_order(self, payload: dict):
+        """Submit a Tradier class=multileg order (vertical spreads).
+
+        Requires options approval **level 3**. A level-2 account gets an
+        error back from this endpoint; the caller is responsible for falling
+        back to a single-leg trade rather than retrying.
+        """
+        return self._post(f"/accounts/{CONFIG['account_id']}/orders", payload)
+
+    def get_quotes(self, symbols: list) -> dict:
+        """Batch quote lookup — one request instead of one per symbol."""
+        if not symbols:
+            return {}
+        data = self._get("/markets/quotes",
+                         {"symbols": ",".join(symbols), "greeks": "true"})
+        quotes = data.get("quotes", {}).get("quote", [])
+        if isinstance(quotes, dict):
+            quotes = [quotes]
+        return {q.get("symbol"): q for q in quotes if q.get("symbol")}
+
     def cancel_order(self, order_id: str):
         return requests.delete(
             f"{self.base}/accounts/{CONFIG['account_id']}/orders/{order_id}",
@@ -162,7 +191,187 @@ class OptionsSelector:
             log.warning(f"Expiry error for {ticker}: {e}")
         return None
 
-    def select_contract(self, signal: dict, capital: float) -> Optional[dict]:
+    def select_deep_itm(self, signal: dict, capital: float,
+                        overrides: dict | None = None) -> Optional[dict]:
+        """Level-2 downside structure: a deep ITM CALL on an inverse ETF.
+
+        Two translations happen here.
+
+        **Direction.** A bearish signal on SPY/QQQ becomes a *call* on an
+        inverse ETF. Buying a call is options level 2; a put spread is level
+        3. The economics of "long SQQQ call" and "long QQQ put" are close
+        enough for this purpose, and the approval requirement is not.
+
+        **Depth.** Rather than a fixed strike offset, ask the chain what the
+        budget can actually reach — see deep_itm.build_deep_itm. Searching
+        across several expiries matters more than it looks: extrinsic value
+        scales with the square root of time, so the same budget that buys a
+        0.78-delta contract expiring tomorrow may reach nothing at all on a
+        Friday-expiry chain four days out.
+
+        Returns None rather than quietly buying an at-the-money contract. A
+        near-the-money option after a vol spike is the exact position this
+        whole path exists to avoid.
+        """
+        ov = overrides or {}
+        if signal["direction"] != "PUT":
+            return None      # only the bearish side routes through an inverse ETF
+
+        underlyings = CONFIG.get("crash_underlyings", ["SQQQ"])
+        max_expiries = int(CONFIG.get("crash_max_expiries_to_scan", 3))
+        # Deep ITM contracts cost several times an OTM lottery ticket, so crash
+        # mode gets its own per-trade cap. Your normal max_trade_size is left
+        # alone — this only applies to the downside structure.
+        #
+        # crash_max_trade_size is the FINAL budget: it is not multiplied by
+        # size_mult or vix_size_mult on top. Choosing a smaller cap IS the
+        # size reduction. Applying the multipliers as well would take $250 down
+        # to $100, which reaches no qualifying contract at all — the agent would
+        # run every cycle and silently never trade. Same double-counting trap as
+        # stacking the VIX and regime multipliers.
+        explicit = "crash_max_trade_size" in CONFIG
+        per_trade = float(CONFIG.get("crash_max_trade_size",
+                                     CONFIG.get("max_trade_size", capital)))
+        budget = min(capital, per_trade)
+        if not explicit:
+            budget *= min(float(ov.get("size_mult", 1.0)),
+                          float(signal.get("vix_size_mult", 1.0) or 1.0))
+        if budget <= 0:
+            return None
+        log.info(f"  💵 Deep ITM budget: ${budget:.0f} "
+                 f"({'crash_max_trade_size' if explicit else 'sized from max_trade_size'})")
+
+        for etf in underlyings:
+            try:
+                q = self.client.get_quote(etf)
+                spot = float(q.get("quotes", {}).get("quote", {}).get("last", 0) or 0)
+                if spot <= 0:
+                    log.info(f"  ⬜ {etf}: no quote — skipping")
+                    continue
+
+                resp = self.client.get_options_expirations(etf)
+                dates = resp.get("expirations", {}).get("date", []) if resp else []
+                if isinstance(dates, str):
+                    dates = [dates]
+                today = datetime.now().date()
+                usable = [d for d in sorted(dates)
+                          if (datetime.strptime(d, "%Y-%m-%d").date() - today).days
+                          >= CONFIG.get("min_days_to_expiry", 0)][:max_expiries]
+
+                for exp in usable:
+                    chain = self.client.get_options_chain(etf, exp)
+                    options = (chain.get("options") or {}).get("option", []) \
+                        if isinstance(chain, dict) else []
+                    if isinstance(options, dict):
+                        options = [options]
+                    if not options:
+                        continue
+
+                    pick = deep_itm.build_deep_itm(
+                        options, spot, "CALL", budget,
+                        cfg=CONFIG.get("deep_itm_cfg"))
+                    if not pick:
+                        continue
+
+                    dte = (datetime.strptime(exp, "%Y-%m-%d").date() - today).days
+                    log.info(
+                        f"  🔄 Routing {signal['ticker']} PUT signal → "
+                        f"{etf} CALL (inverse ETF, level 2). "
+                        f"{dte}DTE, {pick['extrinsic_pct']:.0f}% of the premium "
+                        f"is volatility value."
+                    )
+                    if etf != underlyings[0]:
+                        log.info(f"  ↩️  Note: {underlyings[0]} had no reachable "
+                                 f"structure at ${budget:.0f}; used {etf} instead.")
+
+                    return {
+                        "ticker":        etf,
+                        "direction":     "CALL",
+                        "structure":     "deep_itm",
+                        "option_symbol": pick["option_symbol"],
+                        "strike":        pick["strike"],
+                        "expiry":        exp,
+                        "ask":           pick["ask"],
+                        "bid":           pick["bid"],
+                        "delta":         pick["delta"],
+                        "contracts":     pick["contracts"],
+                        "total_cost":    pick["total_cost"],
+                        "deep_itm":      pick,
+                        "source_signal_ticker": signal["ticker"],
+                        "signal":        signal,
+                    }
+            except Exception as e:
+                log.warning(f"Deep ITM selection error on {etf}: {e}")
+
+        log.info(f"  ⬜ No deep ITM structure reachable at ${budget:.0f} across "
+                 f"{underlyings}. Raise max_trade_size or add a cheaper inverse "
+                 f"ETF to crash_underlyings.")
+        return None
+
+    def select_spread(self, signal: dict, capital: float,
+                      overrides: dict | None = None) -> Optional[dict]:
+        """Build a vertical debit spread for this signal, or None.
+
+        Used when the regime layer sets ``prefer_spreads`` — i.e. implied
+        volatility is already elevated, so a naked long option would be
+        paying peak vega. Returns a trade dict shaped like select_contract's
+        output so the execution path can treat both the same way.
+        """
+        ov = overrides or {}
+        ticker = signal["ticker"]
+        direction = signal["direction"]
+        spot = signal["price"]
+
+        expiry = self.get_nearest_expiry(ticker, days_out=CONFIG["min_days_to_expiry"])
+        if not expiry:
+            return None
+        try:
+            chain = self.client.get_options_chain(ticker, expiry)
+            options = (chain.get("options") or {}).get("option", []) if isinstance(chain, dict) else []
+            if isinstance(options, dict):
+                options = [options]
+            if not options:
+                return None
+
+            # Same rule as select_contract: tighter of the two, never the
+            # product. A vertical's max loss is exactly the debit paid, so
+            # max_trade_size is already the correct risk unit here.
+            budget = min(capital, CONFIG.get("max_trade_size", capital)) * min(
+                float(ov.get("size_mult", 1.0)),
+                float(signal.get("vix_size_mult", 1.0) or 1.0),
+            )
+            if budget <= 0:
+                return None
+
+            spread = spreads_mod.build_debit_spread(
+                options, spot, direction, budget,
+                atr=float(signal.get("atr", 0) or 0),
+                cfg=CONFIG.get("spread_cfg"),
+            )
+            if not spread:
+                return None
+
+            return {
+                "ticker":        ticker,
+                "direction":     direction,
+                "structure":     "vertical_debit",
+                "option_symbol": spread["long_symbol"],   # long leg, for logging
+                "spread":        spread,
+                "strike":        spread["long_strike"],
+                "expiry":        expiry,
+                "ask":           spread["debit"],
+                "bid":           spread["debit"],
+                "contracts":     spread["contracts"],
+                "total_cost":    spread["total_cost"],
+                "signal":        signal,
+            }
+        except Exception as e:
+            log.warning(f"Spread selection error for {ticker}: {e}")
+            return None
+
+    def select_contract(self, signal: dict, capital: float,
+                        overrides: dict | None = None) -> Optional[dict]:
+        ov = overrides or {}
         ticker = signal["ticker"]
         direction = signal["direction"]
         current_price = signal["price"]
@@ -174,6 +383,12 @@ class OptionsSelector:
         if not expiry:
             log.warning(f"No expiry found for {ticker}")
             return None
+
+        # v5: premium ceiling is regime-aware. A flat $3.00 cap silently
+        # rejected every put once IV expanded, which is why the agent found
+        # "no suitable contract" on exactly the days it should have traded.
+        max_price = float(ov.get("max_contract_price",
+                                 CONFIG["max_contract_price"]))
 
         try:
             chain = self.client.get_options_chain(ticker, expiry)
@@ -201,7 +416,7 @@ class OptionsSelector:
                     bid    = float(opt.get("bid", 0))
                     delta  = abs(float(opt.get("greeks", {}).get("delta", 0) or 0))
 
-                    if ask <= 0 or ask < CONFIG.get("min_contract_price", 0.20) or ask > CONFIG["max_contract_price"]:
+                    if ask <= 0 or ask < CONFIG.get("min_contract_price", 0.20) or ask > max_price:
                         continue
                     # Only apply delta filter if greeks look valid
                     if delta > 0.01:
@@ -258,7 +473,25 @@ class OptionsSelector:
             else:
                 size_multiplier = 0.55      # half size for borderline signals
 
+            # v5 FIX: vix_size_mult was computed by the signal engine on every
+            # cycle and then never applied to anything. Volatility-scaled
+            # sizing only exists if you actually multiply by it.
+            #
+            # Take the TIGHTER of the two, do not compound them. Both the VIX
+            # ladder and the regime multiplier are proxies for the same thing —
+            # market stress — so multiplying them double-counts it. In crash
+            # mode that product is 0.45 x 0.40 = 0.18x, which on a $125 per-trade
+            # cap leaves $22 of budget and silently rejects every contract. The
+            # agent would look like it was running while never trading.
+            vix_mult = float(signal.get("vix_size_mult", 1.0) or 1.0)
+            regime_mult = float(ov.get("size_mult", 1.0))
+            size_multiplier *= min(vix_mult, regime_mult)
+
             max_spend = min(capital, CONFIG.get("max_trade_size", capital)) * size_multiplier
+            if max_spend < ask_price * 100:
+                log.info(f"  ⬜ {ticker}: sized budget ${max_spend:.2f} < one contract "
+                         f"${ask_price * 100:.2f} (vix {vix_mult:.2f}x, regime {regime_mult:.2f}x)")
+                return None
             contracts = max(1, int(max_spend / (ask_price * 100)))
             total_cost = contracts * ask_price * 100
 
@@ -269,6 +502,7 @@ class OptionsSelector:
             return {
                 "ticker": ticker,
                 "direction": direction,
+                "structure": "single",
                 "option_symbol": best["symbol"],
                 "strike": float(best["strike"]),
                 "expiry": expiry,
@@ -443,7 +677,9 @@ class RiskManager:
                  f"Limit: ${limit:.2f} | ${remaining:.2f} remaining before kill switch fires")
         return False, "OK"
 
-    def can_trade(self, trade: dict, available_capital: float, regime: str = "neutral") -> tuple[bool, str]:
+    def can_trade(self, trade: dict, available_capital: float, regime: str = "neutral",
+                  overrides: dict | None = None) -> tuple[bool, str]:
+        ov = overrides or {}
         killed, reason = self.check_daily_loss_limit(available_capital)
         if killed:
             return False, reason
@@ -465,23 +701,43 @@ class RiskManager:
         score = trade.get("signal", {}).get("score", 0)
 
         # ── VIX filter ──
+        # v5: the ceiling comes from the regime overrides. In crash mode it is
+        # raised to ~70 so the agent stops disabling itself in high vol; the
+        # protection moves to smaller size + defined-risk spreads instead of a
+        # blanket "don't trade".
+        max_vix = float(ov.get("max_vix", CONFIG.get("max_vix", 28)))
         vix = self._get_vix_cached()
-        if vix > CONFIG.get("max_vix", 28):
-            log.info(f"⚠️  VIX={vix:.1f} > {CONFIG.get('max_vix', 28)} — skipping trade")
+        if vix > max_vix:
+            log.info(f"⚠️  VIX={vix:.1f} > {max_vix} — skipping trade")
             return False, f"VIX too high ({vix:.1f})"
 
         # ── SPY trend alignment ──
+        # In crash mode SPY is down hard by definition, so the "no PUTs on an
+        # up day" rule is kept but the "no CALLs on a down day" rule is
+        # redundant with the direction gate.
         spy_chg = self._get_spy_cached()
         if spy_chg < -1.0 and direction == "CALL":
             return False, f"Blocked CALL — SPY down {spy_chg:.1f}% today"
-        if spy_chg > 1.0 and direction == "PUT":
+        if spy_chg > 1.0 and direction == "PUT" and regime != "crash":
             return False, f"Blocked PUT — SPY up {spy_chg:.1f}% today"
 
         # ── Regime filter ──
+        if not ov.get("allow_calls", True) and direction == "CALL":
+            return False, f"Hard block: CALL in {regime.upper()} regime"
+        if not ov.get("allow_puts", True) and direction == "PUT":
+            return False, f"Hard block: PUT in {regime.upper()} regime"
         if regime == "bear" and direction == "CALL":
             return False, f"Hard block: CALL in BEAR regime"
         if regime == "bull" and direction == "PUT":
             return False, f"Hard block: PUT in BULL regime"
+
+        # ── Defined-risk sanity check for spreads ──
+        # A vertical's maximum loss is the debit paid. If that somehow exceeds
+        # the per-trade cap, something upstream miscalculated — refuse.
+        sp = trade.get("spread")
+        if sp and sp.get("max_loss", 0) > CONFIG.get("max_trade_size", 1e9) * 1.5:
+            return False, (f"Spread max loss ${sp['max_loss']:.0f} exceeds "
+                           f"1.5x max_trade_size")
 
         return True, "OK"
 
@@ -499,6 +755,14 @@ class PositionMonitor:
         self.pending_close_order_ids: dict = {} # symbol → Tradier order ID of the close order
         self.daily_realized_pnl: float = 0.0
         self.time_extended: set = set()   # symbols that have already had time extension
+        # v5: open vertical spreads, keyed by long-leg symbol. Tracked as one
+        # unit — a spread's P&L is meaningless leg by leg.
+        self.spread_positions: dict = {}
+        # v5: check_and_exit is called from BOTH the main cycle and the 30s
+        # fast-monitor thread. Without this, two threads can read the same
+        # position, both decide to close it, and both submit a sell — leaving
+        # you short. The re-entrant lock makes the whole exit pass atomic.
+        self._lock = threading.RLock()
         self._load_entry_prices()
 
     def _entry_prices_path(self):
@@ -528,6 +792,14 @@ class PositionMonitor:
                 log.info(f"Loaded {len(self.peak_prices)} peak price records from disk")
         except Exception as e:
             log.warning(f"Could not load peak prices: {e}")
+        try:
+            path = self._entry_prices_path() + ".spreads"
+            if os.path.exists(path):
+                with open(path) as f:
+                    self.spread_positions = json.load(f)
+                log.info(f"Loaded {len(self.spread_positions)} open spread record(s) from disk")
+        except Exception as e:
+            log.warning(f"Could not load spread positions: {e}")
 
     def _save_entry_prices(self):
         try:
@@ -536,20 +808,33 @@ class PositionMonitor:
                 json.dump(self.entry_prices, f)
             with open(path + ".peaks", "w") as f:
                 json.dump(self.peak_prices, f)
+            with open(path + ".spreads", "w") as f:
+                json.dump(self.spread_positions, f)
         except Exception as e:
             log.warning(f"Could not save entry prices: {e}")
 
-    def record_entry(self, option_symbol: str, entry_price: float, score: float = 13, tp_sl_override: dict = None):
-        self.entry_prices[option_symbol] = entry_price
-        self.entry_prices[option_symbol + "_score"] = score
-        self.entry_prices[option_symbol + "_time"] = datetime.now().isoformat()
-        if tp_sl_override:
-            self.entry_prices[option_symbol + "_tp"] = tp_sl_override.get("tp")
-            self.entry_prices[option_symbol + "_sl"] = tp_sl_override.get("sl")
-            log.info(f"📌 Custom TP/SL for {option_symbol}: TP={tp_sl_override.get('tp')}% SL={tp_sl_override.get('sl')}%")
-        self.peak_prices[option_symbol] = entry_price
-        self.entry_times[option_symbol] = datetime.now()
-        self._save_entry_prices()
+    def record_entry(self, option_symbol: str, entry_price: float, score: float = 13,
+                     tp_sl_override: dict = None, spread: dict = None):
+        with self._lock:
+            self.entry_prices[option_symbol] = entry_price
+            self.entry_prices[option_symbol + "_score"] = score
+            self.entry_prices[option_symbol + "_time"] = datetime.now().isoformat()
+            if tp_sl_override:
+                self.entry_prices[option_symbol + "_tp"] = tp_sl_override.get("tp")
+                self.entry_prices[option_symbol + "_sl"] = tp_sl_override.get("sl")
+                log.info(f"📌 Custom TP/SL for {option_symbol}: TP={tp_sl_override.get('tp')}% SL={tp_sl_override.get('sl')}%")
+            if spread:
+                self.spread_positions[option_symbol] = {
+                    **spread,
+                    "entry_debit": entry_price,
+                    "opened_at": datetime.now().isoformat(),
+                }
+                log.info(f"📌 Tracking spread {spread['long_strike']}/{spread['short_strike']} "
+                         f"as one unit — max loss ${spread['max_loss']:.0f}, "
+                         f"max profit ${spread['max_profit']:.0f}")
+            self.peak_prices[option_symbol] = entry_price
+            self.entry_times[option_symbol] = datetime.now()
+            self._save_entry_prices()
 
     def _dynamic_tp_sl(self, signal_score: float, option_symbol: str = None) -> tuple:
         # Check for TradeJudge override first
@@ -568,6 +853,116 @@ class PositionMonitor:
             return 38.0, 25.0
 
     def check_and_exit(self):
+        """Thread-safe entry point. Held for the whole pass, deliberately.
+
+        The main cycle and the 30s fast-monitor thread both call this. Locking
+        per-mutation would still let two threads each read "P&L is -30%, close
+        it" and each submit a sell. Locking the whole pass means only one
+        thread ever evaluates and acts on a given position state.
+        """
+        with self._lock:
+            self._check_spread_exits()
+            return self._check_and_exit_impl()
+
+    # ── Spread exits (v5) ──────────────────────────────────────────────────
+    def _check_spread_exits(self):
+        """Evaluate open verticals as single units.
+
+        A spread's P&L is (long bid - short ask) versus the debit paid.
+        Marking the legs independently is meaningless and will trip a stop on
+        the long leg while the short leg is quietly offsetting it.
+        """
+        if not self.spread_positions:
+            return
+        for long_sym, sp in list(self.spread_positions.items()):
+            try:
+                short_sym = sp.get("short_symbol")
+                if not short_sym:
+                    continue
+                quotes = self.client.get_quotes([long_sym, short_sym])
+                lq, sq = quotes.get(long_sym), quotes.get(short_sym)
+                if not lq or not sq:
+                    log.info(f"⏳ Spread {long_sym}: quotes unavailable this pass")
+                    continue
+
+                mark = spreads_mod.spread_mark(lq, sq)
+                if not mark["valid"]:
+                    continue
+
+                entry_debit = float(sp.get("entry_debit", sp.get("debit", 0)))
+                pnl_pct = spreads_mod.spread_pnl_pct(entry_debit, mark)
+
+                width = float(sp.get("width", 0))
+                # Max value of a vertical is its width. Taking profit at ~70%
+                # of the theoretical maximum avoids fighting for the last few
+                # cents, which is where the bid/ask eats the whole edge.
+                max_gain_pct = ((width - entry_debit) / entry_debit * 100) if entry_debit else 0
+                tp_pct = float(CONFIG.get("spread_take_profit_pct",
+                                          max(35.0, max_gain_pct * 0.70)))
+                sl_pct = float(CONFIG.get("spread_stop_loss_pct", 55.0))
+
+                peak = self.peak_prices.get(long_sym, entry_debit)
+                if mark["exit_value"] > peak:
+                    self.peak_prices[long_sym] = mark["exit_value"]
+
+                if pnl_pct >= tp_pct:
+                    log.info(f"✅ SPREAD TAKE PROFIT: {long_sym} {pnl_pct:+.1f}% "
+                             f"(target +{tp_pct:.0f}%)")
+                    self._close_spread(long_sym, sp, mark)
+                elif pnl_pct <= -sl_pct:
+                    log.info(f"🛑 SPREAD STOP: {long_sym} {pnl_pct:+.1f}% "
+                             f"(stop -{sl_pct:.0f}%)")
+                    self._close_spread(long_sym, sp, mark)
+                else:
+                    log.info(f"Spread {sp.get('long_strike')}/{sp.get('short_strike')} "
+                             f"{sp.get('direction')}: {pnl_pct:+.1f}% "
+                             f"(value ${mark['exit_value']:.2f} vs debit ${entry_debit:.2f} "
+                             f"| TP +{tp_pct:.0f}% SL -{sl_pct:.0f}%)")
+            except Exception as e:
+                log.error(f"Spread monitor error {long_sym}: {e}")
+
+    def _close_spread(self, long_sym: str, sp: dict, mark: dict):
+        ticker = sp.get("underlying") or (re.match(r'^([A-Z]+)', long_sym).group(1)
+                                          if re.match(r'^([A-Z]+)', long_sym) else long_sym[:6])
+        try:
+            # Cross the spread slightly to actually get out. A vertical that
+            # will not fill is a vertical you still own.
+            limit = max(0.01, mark["exit_value"] * 0.95)
+            payload = spreads_mod.close_spread_payload(ticker, sp, limit)
+            result = self.client.place_multileg_order(payload)
+            entry_debit = float(sp.get("entry_debit", sp.get("debit", 0)))
+            qty = int(sp.get("contracts", 1))
+            pnl = (mark["exit_value"] - entry_debit) * 100 * qty
+            self.daily_realized_pnl += pnl
+            log.info(f"{'💰' if pnl >= 0 else '💸'} SPREAD CLOSED: {ticker} "
+                     f"{sp.get('long_strike')}/{sp.get('short_strike')} | "
+                     f"${pnl:+.2f} | Day total: ${self.daily_realized_pnl:+.2f}")
+            log.info(f"Close order: {result}")
+            self._write_trade_result(long_sym, ticker, qty, entry_debit,
+                                     mark["exit_value"],
+                                     spreads_mod.spread_pnl_pct(entry_debit, mark), pnl)
+            self.spread_positions.pop(long_sym, None)
+            self.peak_prices.pop(long_sym, None)
+            self.entry_times.pop(long_sym, None)
+            self.entry_prices.pop(long_sym, None)
+            self.entry_prices.pop(long_sym + "_score", None)
+            self.entry_prices.pop(long_sym + "_time", None)
+            self._save_entry_prices()
+            self.recently_closed.add(ticker)
+        except Exception as e:
+            log.error(f"❌ Failed to close spread {long_sym}: {e} — "
+                      f"MANUAL INTERVENTION MAY BE REQUIRED (short leg still open)")
+
+    def _spread_leg_symbols(self) -> set:
+        legs = set()
+        for long_sym, sp in self.spread_positions.items():
+            legs.add(long_sym)
+            if sp.get("short_symbol"):
+                legs.add(sp["short_symbol"])
+        return legs
+
+    def _check_and_exit_impl(self):
+        spread_legs = self._spread_leg_symbols()
         try:
             pos_resp = self.client.get_positions()
             if not isinstance(pos_resp, dict):
@@ -598,6 +993,13 @@ class PositionMonitor:
 
             for pos in positions:
                 symbol      = pos.get("symbol", "")
+
+                # ── Skip legs belonging to a tracked spread ──
+                # _check_spread_exits already evaluated these as a unit. Letting
+                # the single-leg logic touch them would sell the long leg on its
+                # own and leave a naked short put open.
+                if symbol in spread_legs:
+                    continue
 
                 # ── Skip if close order pending — wait for fill, or timeout and go market ──
                 if symbol in self.pending_close:
@@ -813,6 +1215,87 @@ class OptionsAgent:
         self.trades_today: list = []
         self.ticker_cooldown: dict = {}
         self.premarket_watchlist: list = []  # populated by run_premarket_scan()
+        self.last_regime_report = None       # most recent crash_mode.RegimeReport
+
+    # ── Regime + concurrent scan (v5) ──────────────────────────────────────
+    def _regime_and_signals(self):
+        """Assess the regime and scan the watchlist in a single async pass.
+
+        Returns ``(RegimeReport, overrides, signals)``.
+
+        Both halves share one HTTP session and one event loop, so the regime
+        inputs (SPY/VIX/VIX3M/HYG/IEF/curve) and every ticker's bars, chain
+        and earnings check go out together instead of ~45 serial round trips.
+
+        Any failure degrades to the original synchronous path. Slow beats
+        blind — this decides whether real money buys options.
+        """
+        if CONFIG.get("use_async_scan", True) and AIOHTTP_AVAILABLE:
+            try:
+                return asyncio.run(self._regime_and_signals_async())
+            except Exception as e:
+                log.warning(f"Async scan failed ({e}) — falling back to sync path")
+
+        # ── Synchronous fallback ──
+        regime_str = self.signals._market_regime()
+        rep = crash_mode.RegimeReport(regime=regime_str, prior_regime=regime_str,
+                                      vix=self.risk._get_vix_cached(), degraded=True)
+        rep.reasons.append("⚠️ Sync fallback — crash detection unavailable this cycle")
+        ov = crash_mode.overrides_for(rep, CONFIG)
+        ov["crash_mode"] = rep.regime == "crash"
+        crash_mode.log_report(rep)
+        sigs = self.signals.get_top_signals(min_score=CONFIG["min_signal_score"])
+        return rep, ov, sigs
+
+    async def _regime_and_signals_async(self):
+        # v5.3: Tradier is the primary data source. Yahoo throttles data-centre
+        # IPs to ~10s per request, which is both slow and — as v5.2 showed —
+        # actively dangerous, since the failures push every symbol onto a
+        # shared fallback path at once.
+        td = None
+        if CONFIG.get("use_tradier_data", True) and AIOHTTP_AVAILABLE:
+            try:
+                td = TradierData(CONFIG["tradier_token"],
+                                 sandbox=CONFIG.get("sandbox", True),
+                                 max_concurrency=int(CONFIG.get("scan_concurrency", 8)))
+                await td.open()
+            except Exception as e:
+                log.warning(f"Tradier data layer unavailable ({e}) — using Yahoo")
+                td = None
+
+        md = AsyncMarketData(
+            max_concurrency=int(CONFIG.get("scan_concurrency", 8)),
+            timeout_secs=float(CONFIG.get("scan_timeout_secs", 12.0)),
+            cache_ttl=float(CONFIG.get("scan_cache_ttl", 45.0)),
+            tradier=td,
+        )
+        await md.open()
+        await md._ensure_crumb()
+        try:
+            rep = await crash_mode.assess(md, CONFIG.get("crash_cfg"))
+            crash_mode.log_report(rep)
+
+            ov = crash_mode.overrides_for(rep, CONFIG)
+            ov["crash_mode"] = rep.regime == "crash"
+            log.info(f"🎛️  Rules: {ov.get('reason','')} | "
+                     f"calls={ov.get('allow_calls')} puts={ov.get('allow_puts')} "
+                     f"size={ov.get('size_mult'):.2f}x "
+                     f"spreads={ov.get('prefer_spreads')} "
+                     f"maxATR={ov.get('max_atr_pct', 5.0)}%")
+
+            min_score = float(ov.get("min_signal_score", CONFIG["min_signal_score"]))
+            sigs = await self.signals.get_top_signals_async(
+                md, min_score, regime=rep.regime, vix=rep.vix, overrides=ov)
+            by_source: dict[str, int] = {}
+            for v in md.source_log.values():
+                by_source[v] = by_source.get(v, 0) + 1
+            if by_source:
+                log.info(f"📡 Data sources this cycle: {by_source}")
+            return rep, ov, sigs
+        finally:
+            await md.close()
+            if td is not None:
+                await td.close()
 
     def _boost_index_signals(self, signals: list, regime: str, spy_chg: float) -> list:
         """
@@ -940,24 +1423,35 @@ class OptionsAgent:
             log.info("Not enough capital to trade. Skipping signal scan.")
             return
 
-        # VIX pre-check
-        if vix > CONFIG.get("max_vix", 28):
-            log.info(f"⚠️  VIX={vix:.1f} > {CONFIG.get('max_vix', 28)} — skipping scan, market too chaotic")
+        # ── Regime assessment + concurrent scan (v5) ──────────────────────────
+        t_scan = time.time()
+        regime_rep, overrides, top_signals = self._regime_and_signals()
+        regime = regime_rep.regime
+        self.last_regime_report = regime_rep
+        log.info(f"⏱️  Regime + scan completed in {time.time() - t_scan:.1f}s")
+
+        # ── Data integrity halt (v5.2) ────────────────────────────────────────
+        # If the market data failed its sanity checks, skip the cycle outright.
+        # Open positions were already evaluated above by check_and_exit, which
+        # prices from the broker rather than from this feed — so exits still
+        # work while entries are frozen. Never open a position on data we
+        # cannot vouch for.
+        if overrides.get("halt"):
+            log.error(f"🛑 CYCLE HALTED — {overrides.get('reason')}")
+            log.error("   No new positions this cycle. Existing positions are "
+                      "still monitored via broker quotes.")
             return
 
-        log.info(f"Scanning watchlist: {CONFIG['watchlist']}")
-        top_signals = self.signals.get_top_signals(min_score=CONFIG["min_signal_score"])
+        # VIX pre-check — the ceiling is now regime-aware. In crash mode it is
+        # raised so the agent stays awake; protection moves to size + spreads.
+        max_vix = float(overrides.get("max_vix", CONFIG.get("max_vix", 28)))
+        if vix > max_vix:
+            log.info(f"⚠️  VIX={vix:.1f} > {max_vix} — skipping scan, market too chaotic")
+            return
 
         if not top_signals:
             log.info("No high-confidence signals found this cycle.")
             return
-
-        # ── Confluence filter — require at least 2/3 timeframes to agree ──
-        if not top_signals:
-            return
-
-        # ── Boost index options on strong trend days ──
-        regime = getattr(self.signals, 'last_regime', 'neutral')
 
         log.info(f"{len(top_signals)} signal(s) passed filters. Top: {top_signals[0]['ticker']} "
                  f"({top_signals[0]['direction']}, score={top_signals[0]['score']})")
@@ -989,14 +1483,59 @@ class OptionsAgent:
                 else:
                     log.info(f"Skipping {ticker} — cooldown ({remaining}s remaining)")
                     continue
-            t = self.selector.select_contract(sig, effective_capital)
+            # ── Structure selection ────────────────────────────────────────
+            # When IV is already elevated, a naked long option is a bet that
+            # volatility keeps rising. A debit spread is a bet on direction.
+            # Prefer the spread and fall back to a single leg if one cannot
+            # be built (thin chain, no reward:risk, level-2 account).
+            t = None
+            structure = CONFIG.get("crash_structure", "deep_itm")
+            if overrides.get("prefer_defined_risk"):
+                if structure == "deep_itm":
+                    t = self.selector.select_deep_itm(sig, effective_capital, overrides)
+                elif structure == "spread":
+                    t = self.selector.select_spread(sig, effective_capital, overrides)
+                if not t and CONFIG.get("crash_allow_single_leg_fallback", False):
+                    log.info(f"  ↩️  {ticker}: no {structure} structure — "
+                             f"falling back to a plain single leg")
+                elif not t:
+                    # Deliberate: an at-the-money option bought after a vol
+                    # spike is the position this whole path exists to avoid.
+                    # Standing down beats taking the trade we ruled out.
+                    log.info(f"  ⬜ {ticker}: no {structure} structure available "
+                             f"and single-leg fallback is disabled — standing down")
+                    continue
+            if not t:
+                t = self.selector.select_contract(sig, effective_capital, overrides)
+
             if t:
-                spread_pct = (t['ask'] - t['bid']) / ((t['ask'] + t['bid']) / 2) * 100 if t.get('bid') else 0
-                log.info(
-                    f"Trade candidate: {t['option_symbol']} | {t['contracts']} contracts "
-                    f"@ ${t['ask']:.2f} | Total: ${t['total_cost']:.2f} | Spread: {spread_pct:.1f}%"
-                )
-                can_trade, reason = self.risk.can_trade(t, effective_capital, regime)
+                if t.get("structure") == "deep_itm":
+                    d = t["deep_itm"]
+                    log.info(
+                        f"Trade candidate: {t['ticker']} CALL {d['strike']} DEEP ITM "
+                        f"(from {t['source_signal_ticker']} PUT signal) | "
+                        f"{t['contracts']}x @ ${d['ask']:.2f} | "
+                        f"Total: ${t['total_cost']:.2f} | delta {d['delta']:.2f} | "
+                        f"intrinsic ${d['intrinsic']:.2f} + extrinsic ${d['extrinsic']:.2f} "
+                        f"({d['extrinsic_pct']:.0f}%) | BE {d['breakeven']}"
+                    )
+                elif t.get("structure") == "vertical_debit":
+                    sp = t["spread"]
+                    log.info(
+                        f"Trade candidate: {ticker} {sp['direction']} "
+                        f"{sp['long_strike']}/{sp['short_strike']} SPREAD | "
+                        f"{t['contracts']}x @ ${sp['debit']:.2f} debit | "
+                        f"Total: ${t['total_cost']:.2f} | "
+                        f"Max loss ${sp['max_loss']:.0f} / max profit ${sp['max_profit']:.0f} "
+                        f"| R:R {sp['reward_risk']:.2f} | BE {sp['breakeven']}"
+                    )
+                else:
+                    spread_pct = (t['ask'] - t['bid']) / ((t['ask'] + t['bid']) / 2) * 100 if t.get('bid') else 0
+                    log.info(
+                        f"Trade candidate: {t['option_symbol']} | {t['contracts']} contracts "
+                        f"@ ${t['ask']:.2f} | Total: ${t['total_cost']:.2f} | Spread: {spread_pct:.1f}%"
+                    )
+                can_trade, reason = self.risk.can_trade(t, effective_capital, regime, overrides)
                 if not can_trade:
                     log.info(f"Risk manager blocked: {reason} — trying next signal")
                     continue
@@ -1026,7 +1565,14 @@ class OptionsAgent:
             if trade["contracts"] != original_contracts:
                 log.info(f"🤖 TradeJudge resized: {original_contracts} → {trade['contracts']} contracts ({size_multiplier}x)")
 
-        log.info(f"EXECUTING: Buy {trade['contracts']}x {trade['option_symbol']} @ market")
+        is_spread = trade.get("structure") == "vertical_debit"
+        if is_spread:
+            sp = trade["spread"]
+            log.info(f"EXECUTING: {trade['contracts']}x {trade['ticker']} "
+                     f"{sp['long_strike']}/{sp['short_strike']} {sp['direction']} "
+                     f"debit spread @ ${sp['debit']:.2f}")
+        else:
+            log.info(f"EXECUTING: Buy {trade['contracts']}x {trade['option_symbol']} @ market")
         try:
             # ── FIX 3: Set cooldown and pending_tickers BEFORE place_order ──
             # Prevents any overlap if execution is slow or threading races occur
@@ -1034,21 +1580,66 @@ class OptionsAgent:
             pending_tickers.add(trade["ticker"])
             log.info(f"Cooldown set for {trade['ticker']} — no re-entry for 400s (entry lock)")
 
-            result = self.client.place_order(
-                symbol=trade["ticker"],
-                option_symbol=trade["option_symbol"],
-                side="buy_to_open",
-                quantity=trade["contracts"],
-                order_type="market"
-            )
+            if is_spread:
+                payload = spreads_mod.open_spread_payload(trade["ticker"], trade["spread"])
+                try:
+                    result = self.client.place_multileg_order(payload)
+                except Exception as me:
+                    # Almost always options approval level 2 rejecting a
+                    # multileg order. Fall back to the single long leg rather
+                    # than retrying — a half-filled spread is a naked short.
+                    log.warning(f"⚠️  Multileg order rejected ({me}) — "
+                                f"falling back to single long leg. If this repeats, "
+                                f"your Tradier account likely needs options level 3.")
+                    trade = self.selector.select_contract(best_signal, effective_capital, overrides)
+                    if not trade:
+                        log.info("No single-leg fallback available — skipping cycle.")
+                        return
+                    is_spread = False
+                    # Re-apply the judge's sizing decision; the fallback
+                    # rebuilt the trade from scratch and lost it.
+                    if size_multiplier != 1.0:
+                        trade["contracts"] = max(1, round(trade["contracts"] * size_multiplier))
+                        trade["total_cost"] = trade["contracts"] * trade["ask"] * 100
+                    result = self.client.place_order(
+                        symbol=trade["ticker"],
+                        option_symbol=trade["option_symbol"],
+                        side="buy_to_open",
+                        quantity=trade["contracts"],
+                        order_type="market",
+                    )
+            else:
+                result = self.client.place_order(
+                    symbol=trade["ticker"],
+                    option_symbol=trade["option_symbol"],
+                    side="buy_to_open",
+                    quantity=trade["contracts"],
+                    order_type="market"
+                )
             score = best_signal.get("score", 13)
             # Merge sl_hint from signal engine into tp_sl_override if TradeJudge didn't set SL
+            # Deep ITM moves differently from an OTM lottery ticket: high delta
+            # on a 3x ETF means a 1% index move is already ~20-30% on the
+            # contract, so the default OTM take-profit/stop percentages are the
+            # wrong scale. Use crash-specific levels instead.
+            if trade.get("structure") == "deep_itm":
+                tp_sl_override = {
+                    "tp": float(CONFIG.get("deep_itm_take_profit_pct", 35.0)),
+                    "sl": float(CONFIG.get("deep_itm_stop_loss_pct", 30.0)),
+                }
+                log.info(f"📊 Deep ITM TP/SL: +{tp_sl_override['tp']}% / "
+                         f"-{tp_sl_override['sl']}%")
+
             sl_hint = best_signal.get("sl_hint")
             if sl_hint and (tp_sl_override is None or tp_sl_override.get("sl") is None):
                 tp_sl_override = tp_sl_override or {}
                 tp_sl_override["sl"] = sl_hint
                 log.info(f"📊 SL scaled to contract price: {sl_hint}%")
-            self.monitor.record_entry(trade["option_symbol"], trade["ask"], score, tp_sl_override=tp_sl_override)
+            spread_rec = None
+            if is_spread:
+                spread_rec = {**trade["spread"], "underlying": trade["ticker"]}
+            self.monitor.record_entry(trade["option_symbol"], trade["ask"], score,
+                                      tp_sl_override=tp_sl_override, spread=spread_rec)
             self.monitor.last_regime = regime
             self.trades_today.append({**trade, "result": result, "time": datetime.now().isoformat()})
             log.info(f"Order submitted: {json.dumps(result, indent=2)}")
@@ -1105,19 +1696,44 @@ class OptionsAgent:
         log.info("⚡ Fast position monitor started (30s interval)")
 
     def run_loop(self):
-        log.info("OptionsAgent starting — MAXIMUM AGGRESSION MODE v4.1")
+        log.info("OptionsAgent starting — v5 (crash-aware, async scan)")
         log.info(f"   Capital limit:    ${self.risk._dynamic_capital_limit():.2f} (dynamic)")
-        log.info(f"   Capital scaling:  75% of gains reinvested (raised from 50%)")
+        log.info(f"   Capital scaling:  75% of gains reinvested")
         log.info(f"   Take profit:      dynamic (score>=16: +45%, >=14: +42%, else: +38%)")
-        log.info(f"   Stop loss:        25% (tightened from 33%)")
+        log.info(f"   Stop loss:        25% single leg | "
+                 f"{CONFIG.get('spread_stop_loss_pct', 55)}% spread")
         log.info(f"   Max positions:    {self.risk._dynamic_max_positions()} (dynamic)")
-        log.info(f"   Confluence req:   2/3 timeframes must agree (relaxed from 3/3)")
-        log.info(f"   VIX filter:       skip trades when VIX > 25")
-        log.info(f"   SPY filter:       no CALLs on SPY <-1%, no PUTs on SPY >+1%")
-        log.info(f"   Index boost:      SPY/QQQ/TQQQ/SPXL prioritized on trend days")
+        log.info(f"   Confluence req:   3/3 timeframes must agree")
         log.info(f"   Time exit:        force close after 90min no movement")
-        log.info(f"   Theta block:      REMOVED — full trading hours until 4pm")
         log.info(f"   Sandbox:          {CONFIG['sandbox']}")
+        log.info("   ── v5 ──")
+        log.info(f"   Async scan:       {'ON' if CONFIG.get('use_async_scan', True) and AIOHTTP_AVAILABLE else 'OFF (sync fallback)'}"
+                 f" | concurrency {CONFIG.get('scan_concurrency', 8)}")
+        log.info(f"   Crash mode:       {'ARMED' if CONFIG.get('crash_mode_enabled', False) else 'DISABLED (set crash_mode_enabled=True to arm)'}")
+        log.info(f"   Detection:        VIX level + VIX/VIX3M term structure + "
+                 f"SPY 20d drawdown + credit (HYG/IEF)")
+        _struct = CONFIG.get("crash_structure", "deep_itm")
+        log.info(f"   In crash:         PUTs only, {_struct}, "
+                 f"max VIX ceiling lifted to {crash_mode.DEFAULTS['crash_max_vix']:.0f}")
+        if _struct == "deep_itm":
+            log.info(f"   Structure:        deep ITM CALLs on "
+                     f"{CONFIG.get('crash_underlyings', ['SQQQ'])} "
+                     f"(inverse ETF = long call = options level 2)")
+            log.info(f"   Budget/trade:     ${CONFIG.get('crash_max_trade_size', 250):.0f} "
+                     f"| max extrinsic "
+                     f"{CONFIG.get('deep_itm_cfg', {}).get('max_extrinsic_pct', 40)}% of premium")
+            log.info(f"   If unreachable:   "
+                     f"{'falls back to a single leg' if CONFIG.get('crash_allow_single_leg_fallback') else 'STANDS DOWN (will not buy near-the-money)'}")
+        elif _struct == "spread":
+            log.warning("   ⚠️  crash_structure='spread' requires Tradier options "
+                        "LEVEL 3. On level 2 it degrades to a single leg.")
+        if not CONFIG.get("crash_mode_enabled", False):
+            log.warning("   ⚠️  Crash mode is DISABLED — the agent will still go "
+                        "flat in high vol exactly as it did before. This is the "
+                        "safe default; arm it deliberately.")
+        if CONFIG.get("crash_mode_enabled", False) and not CONFIG.get("sandbox", True):
+            log.warning("   ⚠️  LIVE + crash mode armed. Run preflight.py first to "
+                        "confirm a structure is actually reachable at your budget.")
 
         last_summary_date = None
         self._fast_monitor_loop()
