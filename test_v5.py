@@ -853,6 +853,86 @@ def test_exit_leaks():
     CONFIG["close_all_by_et"] = orig_time or "15:45"
 
 
+# ── 14. Score sizing + shadow logging (v5.7) ───────────────────────────────────
+def test_scoring_and_shadow():
+    print("\n[14] Score sizing + shadow logging")
+    import scoring
+
+    check("Q1 (the only losing quartile) sizes to ZERO",
+          scoring.size_for_score(14.2) == 0.0)
+    check("Q2 sizes small", scoring.size_for_score(15.0) == 0.40)
+    check("Q3 sizes medium", scoring.size_for_score(16.5) == 0.70)
+    check("Q4 sizes full", scoring.size_for_score(19.9) == 1.00)
+    check("monotonic across the curve",
+          scoring.size_for_score(14.2) <= scoring.size_for_score(15.0)
+          <= scoring.size_for_score(16.5) <= scoring.size_for_score(19.9))
+    check("the +913% outlier's score (19.9) gets full size",
+          scoring.size_for_score(19.9) == 1.0)
+    check("malformed curve degrades to 1.0x rather than crashing",
+          scoring.size_for_score(16.0, [["bad", "rows"]]) == 1.0)
+    check("explain() names the skip reason",
+          "SKIP" in scoring.explain(14.0))
+    check("floor_score is the lowest TRADEABLE score, not the lowest threshold",
+          scoring.floor_score() == 14.7, str(scoring.floor_score()))
+    check("floor_score handles a curve with no skip band",
+          scoring.floor_score([[999.0, 1.0]]) == 0.0)
+
+    # a custom curve must be honoured
+    check("custom curve respected",
+          scoring.size_for_score(20.0, [[25.0, 0.5]]) == 0.5)
+
+    # ── shadow logger ──
+    import shadow, tempfile, os, json as _json
+    from pathlib import Path
+    tmp = tempfile.mkdtemp()
+    orig = shadow._path
+    shadow._path = lambda name: Path(tmp) / name
+    try:
+        sl = shadow.ShadowLogger(enabled=True)
+        sl.record([
+            {"ticker": "NVDA", "stage": "confluence", "direction": "CALL",
+             "spot": 224.0, "call_tfs": 2, "put_tfs": 1},
+            {"ticker": "SPY", "stage": "gate2", "direction": "PUT",
+             "spot": 772.0},
+            {"ticker": "AMD", "stage": "accepted", "direction": "CALL",
+             "spot": 300.0, "score": 17.1, "accepted": True},
+            {"ticker": "NOPRICE", "stage": "gate2", "direction": "CALL"},
+        ], regime="bull", vix=14.7)
+        lines = [_json.loads(l) for l in
+                 open(Path(tmp) / shadow.PENDING) if l.strip()]
+        check("records rejected signals", len(lines) == 3,
+              f"got {len(lines)}")
+        check("a signal with no spot price is dropped (unmeasurable)",
+              all(r["ticker"] != "NOPRICE" for r in lines))
+        check("accepted signals recorded too, for comparison",
+              any(r["accepted"] for r in lines))
+        check("rejection stage preserved",
+              {r["stage"] for r in lines} == {"confluence", "gate2", "accepted"})
+
+        # forward return must be SIGNED by the claimed direction
+        idx = pd.date_range("2026-08-12 14:00", periods=40, freq="5min", tz="UTC")
+        up = pd.DataFrame({"Open": 100.0, "High": 101.0, "Low": 99.0,
+                           "Close": np.linspace(100, 110, 40),
+                           "Volume": 1000.0}, index=idx)
+        rec_call = {"ts": "2026-08-12T14:00:00+00:00", "ticker": "X",
+                    "stage": "gate2", "implied_direction": "CALL",
+                    "score": 15.0, "regime": "bull", "vix": 14.0,
+                    "accepted": False, "spot": 100.0}
+        m = shadow.ShadowLogger._measure(rec_call, up)
+        check("rising underlying → POSITIVE signed return for a CALL signal",
+              m and m["signed_30m"] > 0, str(m and m.get("signed_30m")))
+        rec_put = {**rec_call, "implied_direction": "PUT"}
+        m2 = shadow.ShadowLogger._measure(rec_put, up)
+        check("same rise → NEGATIVE signed return for a PUT signal",
+              m2 and m2["signed_30m"] < 0, str(m2 and m2.get("signed_30m")))
+        check("raw and signed differ only in sign",
+              abs(m["ret_30m"]) == abs(m2["signed_30m"]))
+        check("no bars → returns None, never a fabricated number",
+              shadow.ShadowLogger._measure(rec_call, pd.DataFrame()) is None)
+    finally:
+        shadow._path = orig
+
+
 # ── 7. Config integrity ────────────────────────────────────────────────────────
 def test_config():
     print("\n[7] Config")
@@ -878,8 +958,46 @@ def test_config():
         print("        a reachable structure before running live.")
     else:
         print("     ℹ️  crash mode disarmed (shipped default)")
-    check("original keys survived the splice",
-          CONFIG["capital_limit"] == 500.0 and CONFIG["min_signal_score"] == 15.9)
+    # "Survived" means the splice did not CLOBBER your settings — not that
+    # they still hold the values I shipped. capital_limit and min_signal_score
+    # are yours to tune; asserting specific numbers makes the suite go red on
+    # a legitimate change, which is how you learn to skim past red.
+    for k, typ in (("capital_limit", (int, float)),
+                   ("max_trade_size", (int, float)),
+                   ("min_signal_score", (int, float)),
+                   ("watchlist", list)):
+        check(f"original key intact: {k}",
+              k in CONFIG and isinstance(CONFIG[k], typ),
+              f"{CONFIG.get(k)!r}")
+    check("watchlist not emptied", len(CONFIG.get("watchlist", [])) > 0)
+
+    # Score sizing and the hard threshold are two gates on the same thing.
+    # Flag the overlap rather than failing on it.
+    if CONFIG.get("use_score_sizing", True):
+        import scoring as _sc
+        floor = _sc.floor_score(CONFIG.get("score_size_curve"))
+        thr = CONFIG.get("min_signal_score")
+        if floor and thr is not None and float(thr) < float(floor):
+            print(f"     ℹ️  min_signal_score={thr} is below the sizing curve's")
+            print(f"        skip band (<{floor}). The curve is doing the gating;")
+            print(f"        set min_signal_score={floor} to make that explicit.")
+    # v5.11: this was a hard check in v5.10, on the theory that a mismatch
+    # silently killed trades. It did — but the real defect was the ORDERING in
+    # select_contract, not the config values, and that is now fixed: selection
+    # is bounded by the sized budget, so it finds a cheaper strike instead of
+    # returning None. A mismatch is now a reach problem, not a correctness one,
+    # so it drops to advisory. A suite that goes red on a legitimate risk
+    # setting teaches you to skim past red.
+    _mt = float(CONFIG.get("max_trade_size", 0))
+    _mcp = float(CONFIG.get("max_contract_price", 0))
+    if _mcp > _mt / 100.0 + 0.01:
+        print(f"     ℹ️  max_contract_price ${_mcp:.2f} exceeds what "
+              f"max_trade_size ${_mt:.0f} buys (${_mt/100:.2f}/contract).")
+        print(f"        Selection will fit itself to the budget by moving")
+        print(f"        further OTM. Not broken — but that is where the -94%")
+        print(f"        tail lives. Raise max_trade_size to ${_mcp*100:.0f} to")
+        print(f"        actually trade the strikes you configured.")
+
     check("crash score delta is positive (harder, not easier)",
           CONFIG["crash_cfg"]["crash_min_score_delta"] > 0)
 
@@ -1044,6 +1162,224 @@ def test_end_to_end():
     CONFIG["crash_structure"] = _orig_struct
 
 
+class BalanceBroker(FakeTradier):
+    """Broker with a grown account: $1,139 equity against a $500 base."""
+
+    def __init__(self, cash=1139.0, equity=1138.75):
+        super().__init__()
+        self.cash = cash
+        self.equity = equity
+
+    def get_account_balances(self):
+        return {"balances": {"cash": {"cash_available": self.cash},
+                             "total_equity": self.equity}}
+
+
+def test_capital_scaling():
+    """v5.13: capital_limit was both the base AND the ceiling, so growth was dead.
+
+    Live 2026-08-18: equity ~$1,139, _dynamic_capital_limit() computed $979.06,
+    and get_available_capital() returned $500.00 — because it capped at
+    capital_limit, which is the same number the growth formula starts from.
+    min(<=500, 979) is always 500. The startup banner claimed "75% of gains
+    reinvested" the whole time.
+    """
+    print("\n[16] Capital availability and the growth cap (v5.13)")
+    import agent as ag
+    from config import CONFIG
+
+    _sandbox = CONFIG.get("sandbox")
+    _base = CONFIG.get("capital_limit")
+    _scale = CONFIG.get("scale_available_with_gains", False)
+    CONFIG["sandbox"] = False
+    CONFIG["capital_limit"] = 500.0
+    try:
+        b = BalanceBroker()
+        r = ag.RiskManager(b)
+
+        # Default OFF: behaviour is exactly as shipped. This matters — the
+        # fix must not quietly deploy more of someone's money.
+        CONFIG["scale_available_with_gains"] = False
+        avail = r.get_available_capital()
+        check("scaling OFF still caps deployable cash at capital_limit",
+              abs(avail - 500.0) < 0.01, f"${avail:.2f}")
+
+        limit = r._dynamic_capital_limit()
+        check("dynamic limit reflects the grown account (~$979)",
+              abs(limit - 979.06) < 1.0, f"${limit:.2f}")
+        check("the bug is real: effective capital ignores the dynamic limit",
+              min(avail, limit) == avail and avail < limit,
+              f"min(${avail:.0f}, ${limit:.0f})")
+
+        # ON: the ceiling tracks the same formula the limit uses.
+        CONFIG["scale_available_with_gains"] = True
+        avail2 = r.get_available_capital()
+        check("scaling ON raises deployable cash to the dynamic limit",
+              abs(avail2 - limit) < 1.0, f"${avail2:.2f} vs ${limit:.2f}")
+        check("scaling ON never exceeds actual cash on hand",
+              avail2 <= b.cash + 0.01, f"${avail2:.2f} vs ${b.cash:.2f}")
+
+        # Cash below the ceiling must still bind — no phantom buying power.
+        poor = ag.RiskManager(BalanceBroker(cash=180.0, equity=1138.75))
+        check("cash on hand binds before the scaled ceiling",
+              abs(poor.get_available_capital() - 180.0) < 0.01)
+
+        # A losing account must not scale below its own base.
+        down = ag.RiskManager(BalanceBroker(cash=300.0, equity=300.0))
+        check("a drawdown does not scale the ceiling below capital_limit",
+              abs(down.get_available_capital() - 300.0) < 0.01)
+    finally:
+        CONFIG["sandbox"] = _sandbox
+        CONFIG["capital_limit"] = _base
+        CONFIG["scale_available_with_gains"] = _scale
+
+
+class NullGreeksBroker(FakeTradier):
+    """Chain where Tradier reports greeks: null — as it does for thin strikes."""
+
+    def get_options_expirations(self, symbol):
+        from datetime import date, timedelta as _td
+        t = date.today()
+        return {"expirations": {"date": [(t + _td(days=d)).isoformat()
+                                         for d in (2, 9)]}}
+
+    def get_options_chain(self, symbol, expiration):
+        opts = _priced_call_chain()
+        for o in opts:
+            o["greeks"] = None          # the key EXISTS, its value is null
+        return {"options": {"option": opts}}
+
+
+def test_null_greeks():
+    """v5.12: `opt.get("greeks", {})` returns None when the value is null.
+
+    The default only applies to a MISSING key. Tradier sends the key with a
+    null value for contracts ORATS has no data on, so .get() was called on
+    None, raised AttributeError, and the bare `except: continue` swallowed it.
+    Every such contract disappeared from the search with no log line at all.
+    """
+    print("\n[17] Null greeks must not silently delete contracts (v5.12)")
+    import agent as ag
+    from config import CONFIG
+
+    sel = ag.OptionsSelector(NullGreeksBroker())
+    sig = {"ticker": "TST", "direction": "CALL", "price": 100.0,
+           "score": 21.0, "confluence": 4, "vix_size_mult": 1.0}
+
+    _mt, _dte = CONFIG.get("max_trade_size"), CONFIG.get("min_days_to_expiry")
+    CONFIG["max_trade_size"] = 1000.0
+    CONFIG["min_days_to_expiry"] = 0
+    try:
+        got = sel.select_contract(sig, 100000.0, {"max_contract_price": 10.0})
+        check("null greeks fall through to strike proximity, not oblivion",
+              got is not None,
+              "returned None — the AttributeError path is back")
+        if got:
+            check("proximity fallback stays within 5% of spot",
+                  abs(got["strike"] - 100.0) / 100.0 <= 0.05,
+                  f"strike {got['strike']}")
+    finally:
+        CONFIG["max_trade_size"] = _mt
+        CONFIG["min_days_to_expiry"] = _dte
+
+
+def _priced_call_chain(spot=100.0, lo=93, hi=111):
+    """CALL chain spanning ~$0.72 to ~$9.17 with deltas inside 0.20-0.70.
+
+    Deliberately wide, so a budget ceiling has somewhere cheaper to land.
+    """
+    out = []
+    for k in range(lo, hi + 1):
+        intrinsic = max(0.0, spot - k)
+        tv = max(0.30, 4.0 - abs(k - spot) * 0.30)
+        mid = intrinsic + tv
+        out.append({
+            "symbol": f"TST260814C{k:08d}", "strike": float(k),
+            "option_type": "call", "bid": round(mid / 1.03, 2),
+            "ask": round(mid * 1.03, 2), "open_interest": 900,
+            "volume": 500, "expiration_date": "2026-08-14",
+            "greeks": {"delta": 0.5 + (spot - k) / 40.0},
+        })
+    return out
+
+
+class PricedBroker(FakeTradier):
+    def get_options_expirations(self, symbol):
+        # Relative to today, not hardcoded — a fixed date turns this test into
+        # a time bomb that starts failing the week after it was written.
+        from datetime import date, timedelta as _td
+        t = date.today()
+        return {"expirations": {"date": [(t + _td(days=d)).isoformat()
+                                         for d in (2, 9, 16)]}}
+
+    def get_options_chain(self, symbol, expiration):
+        return {"options": {"option": _priced_call_chain()}}
+
+
+def test_budget_bounded_selection():
+    """v5.11: selection is bounded by the sized budget, not just the config cap.
+
+    The bug this pins down: sizing used to run AFTER the chain search, so the
+    search picked the contract nearest the target strike under the STATIC
+    max_contract_price, then discovered the budget could not reach it and
+    returned None — instead of looking one strike further out for something it
+    could afford. Live symptom, 2026-08-18:
+
+        ✅ AAPL: score=21.0 ... vix_mult=0.85x
+        📏 score 21.0 in band <999.0 → 1.00x size
+        ⬜ AAPL: sized budget $255.00 < one contract $267.00
+
+    A 21.0 signal — the top band, squeeze and unusual flow both true — thrown
+    away over $12, with cheaper strikes sitting in the same chain untouched.
+    """
+    print("\n[15] Budget-bounded contract selection (v5.11)")
+    import agent as ag
+    from config import CONFIG
+
+    sel = ag.OptionsSelector(PricedBroker())
+    sig = {"ticker": "TST", "direction": "CALL", "price": 100.0,
+           "score": 21.0, "confluence": 4, "vix_size_mult": 1.0}
+    ov = {"max_contract_price": 10.0}
+
+    _orig = CONFIG.get("max_trade_size")
+    _orig_dte = CONFIG.get("min_days_to_expiry")
+    CONFIG["min_days_to_expiry"] = 0
+    try:
+        # Roomy budget: takes the contract nearest the target strike.
+        CONFIG["max_trade_size"] = 1000.0
+        rich = sel.select_contract(sig, 100000.0, ov)
+        check("roomy budget selects near the target strike",
+              rich is not None and abs(rich["strike"] - 100.0) <= 1.0,
+              f"{rich and rich['strike']}")
+
+        # Tight budget: must still trade, at a cheaper strike.
+        CONFIG["max_trade_size"] = 300.0
+        tight = sel.select_contract(sig, 100000.0, ov)
+        check("tight budget still returns a contract (the v5.10 bug)",
+              tight is not None,
+              "returned None — selection is not budget-bounded")
+        if tight:
+            check("selected contract fits inside the sized budget",
+                  tight["total_cost"] <= 300.0 + 0.01,
+                  f"${tight['total_cost']:.2f} vs $300")
+            check("tight budget moved to a cheaper strike than the roomy one",
+                  rich is not None and tight["strike"] > rich["strike"],
+                  f"{tight['strike']} vs {rich and rich['strike']}")
+            check("delta stays inside the 0.20-0.70 band under budget pressure",
+                  0.20 <= abs(float(tight["delta"])) <= 0.70,
+                  f"delta={tight['delta']}")
+
+        # Budget below the cheapest contract in the chain: decline, do not
+        # reach for something outside the delta band to make the money fit.
+        CONFIG["max_trade_size"] = 50.0
+        broke = sel.select_contract(sig, 100000.0, ov)
+        check("budget below the whole chain declines rather than degrades",
+              broke is None, f"{broke}")
+    finally:
+        CONFIG["max_trade_size"] = _orig
+        CONFIG["min_days_to_expiry"] = _orig_dte
+
+
 if __name__ == "__main__":
     print("=" * 64)
     print("OptionsAgent v5 — offline verification")
@@ -1060,10 +1396,14 @@ if __name__ == "__main__":
     test_tradier_data()
     test_monitor()
     test_exit_leaks()
+    test_scoring_and_shadow()
     test_config()
     test_end_to_end()
     test_deep_itm()
     test_deep_itm_routing()
+    test_budget_bounded_selection()
+    test_capital_scaling()
+    test_null_greeks()
 
     print("\n" + "=" * 64)
     print(f"PASSED {len(PASS)}   FAILED {len(FAIL)}")

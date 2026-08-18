@@ -546,7 +546,7 @@ class SignalEngine:
                    calls_df=None, puts_df=None, earnings_soon: bool = False,
                    regime: str = "neutral", vix: float = 20.0,
                    overrides: dict | None = None,
-                   spy_5m=None) -> dict | None:
+                   spy_5m=None, trace: list | None = None) -> dict | None:
         """The single scoring implementation. Pure — takes data, returns a signal.
 
         ``overrides`` comes from crash_mode.overrides_for() and may contain:
@@ -555,6 +555,20 @@ class SignalEngine:
           crash_mode                — relaxes the VIX size floor
         """
         ov = overrides or {}
+
+        # v5.7: shadow tracing. Every rejection is recorded with the stage that
+        # caused it and the spot price at that moment, so shadow.py can measure
+        # later what the underlying actually did. Without this the gates are
+        # unmeasurable — a rejected signal leaves no trace and has no outcome.
+        def _trace(stage, direction=None, score=None, spot=None,
+                   call_tfs=None, put_tfs=None):
+            if trace is None:
+                return
+            trace.append({"ticker": ticker, "stage": stage,
+                          "direction": direction, "score": score,
+                          "spot": spot, "call_tfs": call_tfs,
+                          "put_tfs": put_tfs, "accepted": False})
+
         crash_mode  = bool(ov.get("crash_mode"))
         allow_calls = ov.get("allow_calls", True)
         allow_puts  = ov.get("allow_puts", True)
@@ -590,6 +604,9 @@ class SignalEngine:
                 confluence_score = 4
             else:
                 log.info(f"  ⬜ {ticker}: confluence FAILED ({call_tfs}C/{put_tfs}P) — need 3/3")
+                _trace("confluence",
+                       direction="CALL" if call_tfs > put_tfs else "PUT",
+                       spot=price_1h, call_tfs=call_tfs, put_tfs=put_tfs)
                 return None
 
             # ── GATE 1b: Direction gate from the regime overrides ─────────────
@@ -598,9 +615,11 @@ class SignalEngine:
             # bounce.
             if final_direction == "CALL" and not allow_calls:
                 log.info(f"  ⬜ {ticker}: CALLs blocked by {regime.upper()} regime")
+                _trace("regime_block", final_direction, spot=price_1h)
                 return None
             if final_direction == "PUT" and not allow_puts:
                 log.info(f"  ⬜ {ticker}: PUTs blocked by {regime.upper()} regime")
+                _trace("regime_block", final_direction, spot=price_1h)
                 return None
 
             # ── GATE 2: Entry qualifier ────────────────────────────────────────
@@ -618,6 +637,7 @@ class SignalEngine:
 
             if not has_squeeze and not has_uvol:
                 log.info(f"  ⬜ {ticker}: Gate 2 FAILED — no squeeze or unusual options volume")
+                _trace("gate2", final_direction, spot=price_1h)
                 return None
 
             # ── Scoring ────────────────────────────────────────────────────────
@@ -666,6 +686,7 @@ class SignalEngine:
             vol_pct = (atr_val / price_1h * 100) if price_1h > 0 else 0
             if vol_pct > max_atr_pct:
                 log.info(f"  ⬜ {ticker}: ATR too high ({vol_pct:.1f}% > {max_atr_pct}%) — spreads too wide")
+                _trace("atr", final_direction, spot=price_1h)
                 return None
 
             vix_mult = self._vix_size_multiplier(vix, crash_mode=crash_mode)
@@ -771,7 +792,8 @@ class SignalEngine:
     async def get_top_signals_async(self, md, min_score: float,
                                     regime: str = "neutral", vix: float = 20.0,
                                     overrides: dict | None = None,
-                                    watchlist: list | None = None) -> list:
+                                    watchlist: list | None = None,
+                                    trace: list | None = None) -> list:
         """Concurrent replacement for get_top_signals.
 
         Every network call for the whole watchlist is issued at once — three
@@ -833,12 +855,24 @@ class SignalEngine:
                 ticker, df_1h, df_15m, df_5m,
                 calls_df=calls_df, puts_df=puts_df, earnings_soon=earn,
                 regime=regime, vix=vix, overrides=ov, spy_5m=spy_5m,
+                trace=trace,
             )
             if sig is None:
                 continue
             if sig["score"] < min_score:
                 log.info(f"  ⬜ {ticker}: score={sig['score']:.1f} below threshold {min_score}")
+                if trace is not None:
+                    trace.append({"ticker": ticker, "stage": "below_threshold",
+                                  "direction": sig["direction"],
+                                  "score": sig["score"], "spot": sig["price"],
+                                  "accepted": False})
                 continue
+
+            if trace is not None:
+                trace.append({"ticker": ticker, "stage": "accepted",
+                              "direction": sig["direction"],
+                              "score": sig["score"], "spot": sig["price"],
+                              "accepted": True})
 
             signals.append(sig)
             log.info(

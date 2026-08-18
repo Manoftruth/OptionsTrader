@@ -41,6 +41,8 @@ from signal_engine import SignalEngine
 # ── v5 modules ─────────────────────────────────────────────────────────────────
 import crash_mode
 import deep_itm
+import scoring
+from shadow import ShadowLogger
 import spreads as spreads_mod
 from async_data import AsyncMarketData, AIOHTTP_AVAILABLE
 from tradier_data import TradierData
@@ -404,6 +406,75 @@ class OptionsSelector:
         max_price = float(ov.get("max_contract_price",
                                  CONFIG["max_contract_price"]))
 
+        # ── Score-based position sizing ──
+        #
+        # v5.11: this block used to run AFTER contract selection, and that
+        # ordering was the actual bug behind "sized budget $255 < one contract
+        # $267". The loop below picked the contract closest to the target
+        # strike among everything under the STATIC $3.00 ceiling, and only then
+        # discovered the budget could not reach it — at which point it returned
+        # None instead of looking for a cheaper strike it could afford.
+        #
+        # No config value fixes that. Setting max_contract_price to 2.55 just
+        # relocates the failure to the next cycle where vix_mult is 0.80. The
+        # budget has to be known BEFORE the search, so the search is bounded by
+        # what can actually be bought.
+        score = signal.get("score", 13)
+        confluence = signal.get("confluence", 0)
+
+        # v5.7: size from the empirical curve rather than invented tiers.
+        # The old ladder (>=17 → 1.0x, >=16 → 0.85x ...) was not derived
+        # from anything. The curve in scoring.py comes from 229 trades
+        # mined out of agent.log, where win rate, median return and net
+        # dollars all rise monotonically across score quartiles — weakly,
+        # but consistently. Q1 (14.0-14.7) is the only band that lost
+        # money, so it sizes to zero rather than small.
+        if CONFIG.get("use_score_sizing", True):
+            size_multiplier = scoring.size_for_score(
+                score, CONFIG.get("score_size_curve"))
+            log.info(f"  📏 {scoring.explain(score, CONFIG.get('score_size_curve'))}")
+            if size_multiplier <= 0:
+                return None
+        elif score >= 17 and confluence >= 4:
+            size_multiplier = 1.0
+        elif score >= 16:
+            size_multiplier = 0.85
+        elif score >= 15.5:
+            size_multiplier = 0.70
+        else:
+            size_multiplier = 0.55
+
+        # v5 FIX: vix_size_mult was computed by the signal engine on every
+        # cycle and then never applied to anything. Volatility-scaled
+        # sizing only exists if you actually multiply by it.
+        #
+        # Take the TIGHTER of the two, do not compound them. Both the VIX
+        # ladder and the regime multiplier are proxies for the same thing —
+        # market stress — so multiplying them double-counts it. In crash
+        # mode that product is 0.45 x 0.40 = 0.18x, which on a $125 per-trade
+        # cap leaves $22 of budget and silently rejects every contract. The
+        # agent would look like it was running while never trading.
+        vix_mult = float(signal.get("vix_size_mult", 1.0) or 1.0)
+        regime_mult = float(ov.get("size_mult", 1.0))
+        size_multiplier *= min(vix_mult, regime_mult)
+
+        max_spend = min(capital, CONFIG.get("max_trade_size", capital)) * size_multiplier
+        affordable = max_spend / 100.0
+        min_px = float(CONFIG.get("min_contract_price", 0.20))
+
+        if affordable < min_px:
+            log.info(f"  ⬜ {ticker}: sized budget ${max_spend:.2f} cannot reach "
+                     f"the cheapest allowed contract (${min_px * 100:.0f}) "
+                     f"(vix {vix_mult:.2f}x, regime {regime_mult:.2f}x)")
+            return None
+
+        # The real ceiling is whichever binds first.
+        effective_max_price = min(max_price, affordable)
+        if effective_max_price < max_price - 0.005:
+            log.info(f"  💵 {ticker}: budget ${max_spend:.0f} caps contract price "
+                     f"at ${effective_max_price:.2f} (config ceiling "
+                     f"${max_price:.2f}, vix {vix_mult:.2f}x, regime {regime_mult:.2f}x)")
+
         try:
             chain = self.client.get_options_chain(ticker, expiry)
             if not chain:
@@ -423,85 +494,84 @@ class OptionsSelector:
 
             best = None
             best_diff = float("inf")
+            # v5.12: count WHY contracts are discarded. Without this the log
+            # says "checked 56, found none" and there is no way to tell whether
+            # the ceiling, the delta band or a data problem did it.
+            why = {"price": 0, "delta": 0, "no_greeks_far": 0,
+                   "spread": 0, "error": 0}
+            seen: list[tuple] = []
             for opt in side_options:
                 try:
                     strike = float(opt.get("strike", 0))
-                    ask    = float(opt.get("ask", 0))
-                    bid    = float(opt.get("bid", 0))
-                    delta  = abs(float(opt.get("greeks", {}).get("delta", 0) or 0))
+                    ask    = float(opt.get("ask", 0) or 0)
+                    bid    = float(opt.get("bid", 0) or 0)
+                    # v5.12 BUG: Tradier sends "greeks": null for contracts
+                    # ORATS has no data on. opt.get("greeks", {}) returns None
+                    # in that case — the default only applies when the KEY is
+                    # missing, not when its value is null — and .get() on None
+                    # raises AttributeError. The bare `except: continue` below
+                    # then swallowed it, so every such contract disappeared
+                    # from the search leaving no trace at all. `or {}` is the
+                    # difference between "no greeks, fall back to strike
+                    # proximity" and "silently unbuyable".
+                    greeks = opt.get("greeks") or {}
+                    delta  = abs(float(greeks.get("delta", 0) or 0))
 
-                    if ask <= 0 or ask < CONFIG.get("min_contract_price", 0.20) or ask > max_price:
+                    diff = abs(strike - target_strike)
+                    seen.append((diff, strike, ask, bid, delta))
+
+                    if ask <= 0 or ask < min_px or ask > effective_max_price:
+                        why["price"] += 1
                         continue
                     # Only apply delta filter if greeks look valid
                     if delta > 0.01:
                         if delta < 0.20 or delta > 0.70:
+                            why["delta"] += 1
                             continue
                     else:
                         # No valid delta — use strike proximity as proxy
                         # Accept strikes within 5% of current price
-                        price_diff_pct = abs(strike - current_price) / current_price
-                        if price_diff_pct > 0.05:
+                        if abs(strike - current_price) / current_price > 0.05:
+                            why["no_greeks_far"] += 1
                             continue
 
                     mid = (ask + bid) / 2
                     if mid > 0:
                         spread_pct = (ask - bid) / mid
                         if spread_pct > 0.35:
+                            why["spread"] += 1
                             continue
 
-                    diff = abs(strike - target_strike)
                     if diff < best_diff:
                         best_diff = diff
                         best = opt
-                except:
+                except Exception:
+                    why["error"] += 1
                     continue
 
             if not best:
-                log.warning(f"No contract found for {ticker} — checked {len(side_options)} {direction} options. Reasons: "
-                            f"ask<=0 or >max_price, delta out of 0.20-0.70 range, or spread >10%")
-                # Debug: show why top candidates were rejected
-                for opt in side_options[:3]:
-                    try:
-                        ask   = float(opt.get("ask", 0))
-                        bid   = float(opt.get("bid", 0))
-                        delta = abs(float(opt.get("greeks", {}).get("delta", 0)))
-                        mid   = (ask + bid) / 2 if (ask + bid) > 0 else 1
-                        spread_pct = (ask - bid) / mid
-                        log.warning(f"  Rejected {opt.get('symbol','?')}: ask=${ask:.2f} delta={delta:.2f} spread={spread_pct*100:.1f}% max_price=${CONFIG['max_contract_price']}")
-                    except:
-                        pass
+                log.warning(f"No contract found for {ticker} — {len(side_options)} "
+                            f"{direction}s against ask ${min_px:.2f}-"
+                            f"${effective_max_price:.2f}, delta 0.20-0.70, spread <35%")
+                log.warning(f"  rejected by: price={why['price']} delta={why['delta']} "
+                            f"spread={why['spread']} "
+                            f"no-greeks-and-far={why['no_greeks_far']} "
+                            f"errors={why['error']}")
+                # Show the strikes NEAREST the target, not the first three in
+                # the chain — those are the deepest ITM and tell us nothing.
+                for d, k, a, b, dl in sorted(seen)[:6]:
+                    mid = (a + b) / 2
+                    sp = (a - b) / mid * 100 if mid > 0 else 0.0
+                    log.warning(f"    strike {k:<8.1f} ask ${a:<8.2f} delta {dl:<5.2f} "
+                                f"spread {sp:>5.1f}%   (target {target_strike:.1f}, "
+                                f"spot {current_price:.2f})")
                 return None
 
             ask_price = float(best["ask"])
 
-            # ── Score-based position sizing ──
-            score = signal.get("score", 13)
-            confluence = signal.get("confluence", 0)
-
-            if score >= 17 and confluence >= 4:
-                size_multiplier = 1.0       # max size — all 3 TFs agree + very high score
-            elif score >= 16:
-                size_multiplier = 0.85
-            elif score >= 15.5:
-                size_multiplier = 0.70
-            else:
-                size_multiplier = 0.55      # half size for borderline signals
-
-            # v5 FIX: vix_size_mult was computed by the signal engine on every
-            # cycle and then never applied to anything. Volatility-scaled
-            # sizing only exists if you actually multiply by it.
-            #
-            # Take the TIGHTER of the two, do not compound them. Both the VIX
-            # ladder and the regime multiplier are proxies for the same thing —
-            # market stress — so multiplying them double-counts it. In crash
-            # mode that product is 0.45 x 0.40 = 0.18x, which on a $125 per-trade
-            # cap leaves $22 of budget and silently rejects every contract. The
-            # agent would look like it was running while never trading.
-            vix_mult = float(signal.get("vix_size_mult", 1.0) or 1.0)
-            regime_mult = float(ov.get("size_mult", 1.0))
-            size_multiplier *= min(vix_mult, regime_mult)
-
-            max_spend = min(capital, CONFIG.get("max_trade_size", capital)) * size_multiplier
+            # Belt and braces: the search was bounded by effective_max_price,
+            # so this cannot fire. Keep it anyway — a silent overspend is worse
+            # than a logged skip.
             if max_spend < ask_price * 100:
                 log.info(f"  ⬜ {ticker}: sized budget ${max_spend:.2f} < one contract "
                          f"${ask_price * 100:.2f} (vix {vix_mult:.2f}x, regime {regime_mult:.2f}x)")
@@ -574,22 +644,60 @@ class RiskManager:
         return self._spy_cache[1]
 
     def get_available_capital(self) -> float:
+        """Deployable cash: live broker balance, capped.
+
+        v5.13 — capital_limit was doing two contradictory jobs.
+
+        It is the BASE for _dynamic_capital_limit() ("base + 75% of gains"),
+        and it was also the HARD CEILING here. Since the ceiling equalled the
+        base, the dynamic limit could never be reached:
+
+            capital  = get_available_capital()      # min(cash, 500) <= 500
+            cap_lim  = _dynamic_capital_limit()     # 500 + 0.75*gains = 979
+            effective = min(capital, cap_lim)       # min(<=500, 979) = 500
+
+        Observed live 2026-08-18: equity ~$1,139, limit computed at $979.06,
+        deployable clamped to $500.00. The "75% of gains reinvested" line in
+        the startup banner had never once been true in live mode.
+
+        The cap itself is not the bug — it exists to keep the agent out of
+        margin, which is right. The bug is that it never moves. Scaling it
+        with the dynamic limit is OFF by default, because it increases how
+        much real money can be deployed and that is not a change to make on
+        someone's behalf.
+        """
         if CONFIG.get("sandbox", True):
             return float(CONFIG["capital_limit"])
+        base = float(CONFIG["capital_limit"])
         try:
             bal = self.client.get_account_balances()
-            balances = bal.get("balances", {})
-            if isinstance(balances, dict):
-                cash = balances.get("cash", {})
-                if isinstance(cash, dict):
-                    raw = float(cash.get("cash_available", CONFIG["capital_limit"]))
-                    return min(raw, float(CONFIG["capital_limit"]))  # HARD CAP
-                total = balances.get("total_cash", balances.get("cash_available", 0))
-                return min(float(total), float(CONFIG["capital_limit"]))  # HARD CAP
-            return float(CONFIG["capital_limit"])
+            balances = bal.get("balances", {}) or {}
+            if not isinstance(balances, dict):
+                return base
+
+            cash = balances.get("cash", {})
+            if isinstance(cash, dict):
+                raw = float(cash.get("cash_available", base) or base)
+            else:
+                raw = float(balances.get("total_cash",
+                            balances.get("cash_available", 0)) or 0)
+
+            ceiling = base
+            if CONFIG.get("scale_available_with_gains", False):
+                # Same formula as _dynamic_capital_limit, computed from the
+                # balance payload we already have rather than a second call.
+                equity = float(balances.get("total_equity", raw) or raw)
+                pct = float(CONFIG.get("gain_reinvest_pct", 0.75))
+                ceiling = base + max(0.0, equity - base) * pct
+
+            capped = max(0.0, min(raw, ceiling))
+            if raw > ceiling + 0.01:
+                log.info(f"   💼 Cash ${raw:.2f} capped to ${capped:.2f} "
+                         f"(margin guard{'' if ceiling > base else ', static'})")
+            return capped
         except Exception as e:
             log.error(f"Balance fetch error: {e}")
-            return float(CONFIG["capital_limit"])
+            return base
 
     def get_account_balance(self) -> float:
         """Real account equity for P&L and kill switch tracking — NOT capped.
@@ -1304,6 +1412,7 @@ class OptionsAgent:
         self.ticker_cooldown: dict = {}
         self.premarket_watchlist: list = []  # populated by run_premarket_scan()
         self.last_regime_report = None       # most recent crash_mode.RegimeReport
+        self.shadow = ShadowLogger(enabled=CONFIG.get("shadow_logging", True))
 
     # ── Regime + concurrent scan (v5) ──────────────────────────────────────
     def _regime_and_signals(self):
@@ -1373,8 +1482,20 @@ class OptionsAgent:
                      f"maxATR={ov.get('max_atr_pct', 5.0)}%")
 
             min_score = float(ov.get("min_signal_score", CONFIG["min_signal_score"]))
+            trace: list = []
             sigs = await self.signals.get_top_signals_async(
-                md, min_score, regime=rep.regime, vix=rep.vix, overrides=ov)
+                md, min_score, regime=rep.regime, vix=rep.vix, overrides=ov,
+                trace=trace)
+
+            # Shadow logging: every signal the gates rejected, with the spot
+            # price at that moment. shadow.py measures later what the
+            # underlying actually did, which is the only way to find out
+            # whether 3/3 confluence and Gate 2 are worth what they cost.
+            try:
+                self.shadow.record(trace, regime=rep.regime, vix=rep.vix)
+                await self.shadow.resolve(md)
+            except Exception as e:
+                log.debug(f"shadow logging skipped: {e}")
             by_source: dict[str, int] = {}
             for v in md.source_log.values():
                 by_source[v] = by_source.get(v, 0) + 1
@@ -1856,7 +1977,17 @@ class OptionsAgent:
     def run_loop(self):
         log.info("OptionsAgent starting — v5 (crash-aware, async scan)")
         log.info(f"   Capital limit:    ${self.risk._dynamic_capital_limit():.2f} (dynamic)")
-        log.info(f"   Capital scaling:  75% of gains reinvested")
+        # v5.13: this line used to claim gains were reinvested unconditionally.
+        # They were not — the static cap in get_available_capital() made the
+        # dynamic limit unreachable. Say which one is actually in force.
+        if CONFIG.get("scale_available_with_gains", False):
+            log.info(f"   Capital scaling:  ON — "
+                     f"{float(CONFIG.get('gain_reinvest_pct', 0.75)) * 100:.0f}% "
+                     f"of gains deployable")
+        else:
+            log.info(f"   Capital scaling:  OFF — deployable cash capped at "
+                     f"capital_limit ${float(CONFIG['capital_limit']):.2f} "
+                     f"regardless of account growth")
         log.info(f"   Take profit:      dynamic (score>=16: +45%, >=14: +42%, else: +38%)")
         log.info(f"   Stop loss:        25% single leg | "
                  f"{CONFIG.get('spread_stop_loss_pct', 55)}% spread")
@@ -1885,6 +2016,40 @@ class OptionsAgent:
         elif _struct == "spread":
             log.warning("   ⚠️  crash_structure='spread' requires Tradier options "
                         "LEVEL 3. On level 2 it degrades to a single leg.")
+        # ── Budget vs premium-cap coherence (v5.10) ──────────────────────
+        # max_contract_price and max_trade_size are two ceilings on the same
+        # decision and they must agree. Observed live: a 19.5-score AAPL signal
+        # with squeeze AND unusual flow — the profile that actually makes money
+        # — was rejected because a $1.54 contract cost $154 against a $106
+        # sized budget, while max_contract_price cheerfully allowed $300.
+        #
+        # Worse than the missed trade: a low budget silently steers selection
+        # toward cheap far-OTM contracts, which is where the 43% stop-out rate
+        # and the -94% tail live.
+        #
+        # v5.11: the selector now bounds its own search by the sized budget, so
+        # a mismatch no longer costs the trade — it costs REACH. The binding
+        # ceiling becomes budget/100 rather than max_contract_price, and the
+        # search quietly moves further out of the money to fit. That is the
+        # same drift toward cheap far-OTM contracts, arriving silently instead
+        # of as a rejection. So this stays a warning, not an error.
+        _mt = float(CONFIG.get("max_trade_size", 0))
+        _mcp = float(CONFIG.get("max_contract_price", 0))
+        _affordable = _mt / 100.0
+        if _mcp > _affordable + 0.01:
+            log.warning(
+                f"   ⚠️  max_contract_price ${_mcp:.2f} is above what "
+                f"max_trade_size ${_mt:.0f} can buy (${_affordable:.2f}/contract "
+                f"at 1.0x). The effective ceiling is ${_affordable:.2f}.")
+            log.warning(
+                f"       Size multipliers push it lower still — a 0.70x band at "
+                f"vix 0.85x buys ${_mt * 0.70 * 0.85 / 100:.2f}/contract.")
+            log.warning(
+                f"       Not fatal: selection is budget-bounded and will find a "
+                f"cheaper strike. But cheaper means further OTM, which is where "
+                f"the -94% tail lives. Raise max_trade_size to ${_mcp * 100:.0f} "
+                f"to trade the strikes you configured.")
+
         if not CONFIG.get("crash_mode_enabled", False):
             log.warning("   ⚠️  Crash mode is DISABLED — the agent will still go "
                         "flat in high vol exactly as it did before. This is the "
