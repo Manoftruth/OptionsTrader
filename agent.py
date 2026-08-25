@@ -42,6 +42,7 @@ from signal_engine import SignalEngine
 import crash_mode
 import deep_itm
 import scoring
+import shadow as shadow_mod
 from shadow import ShadowLogger
 import spreads as spreads_mod
 from async_data import AsyncMarketData, AIOHTTP_AVAILABLE
@@ -493,7 +494,8 @@ class OptionsSelector:
                 return None
 
             best = None
-            best_diff = float("inf")
+            candidates: list[tuple] = []
+            target_delta = float(CONFIG.get("contract_target_delta", 0.45) or 0)
             # v5.12: count WHY contracts are discarded. Without this the log
             # says "checked 56, found none" and there is no way to tell whether
             # the ceiling, the delta band or a data problem did it.
@@ -542,12 +544,42 @@ class OptionsSelector:
                             why["spread"] += 1
                             continue
 
-                    if diff < best_diff:
-                        best_diff = diff
-                        best = opt
+                    candidates.append((opt, strike, ask, delta))
                 except Exception:
                     why["error"] += 1
                     continue
+
+            # ── pick among what survived ──────────────────────────────────
+            #
+            # v5.16: ranking by |strike - target_strike| was a systematic bias,
+            # not a neutral tie-breaker. target_strike is spot * 1.02, and on a
+            # $474 stock at short expiry that strike carries delta 0.07 — a
+            # point the 0.20-0.70 filter can never accept. So the selector
+            # aimed at an unreachable spot and took whatever passing contract
+            # sat nearest it, which is always the contract closest to the
+            # BOTTOM edge of the band. That is why every affordability scan
+            # came back at delta 0.20-0.25: TSLA 0.21, HOOD 0.20, COIN 0.23,
+            # AMD 0.21. Not a coincidence, a consequence.
+            #
+            # Ranking by |delta - target_delta| aims at the middle of the band
+            # instead. Set contract_target_delta to 0 to restore the old
+            # strike-proximity behaviour.
+            if candidates:
+                with_greeks = [c for c in candidates if c[3] > 0.01]
+                if target_delta > 0 and with_greeks:
+                    pick = min(with_greeks, key=lambda c: abs(c[3] - target_delta))
+                    log.info(f"  🎯 {ticker}: delta {pick[3]:.2f} "
+                             f"(target {target_delta:.2f}) strike {pick[1]:.1f} "
+                             f"@ ${pick[2]:.2f} — chosen from {len(candidates)} "
+                             f"eligible")
+                else:
+                    pick = min(candidates, key=lambda c: abs(c[1] - target_strike))
+                    why_prox = ("delta targeting off" if target_delta <= 0
+                                else "no greeks on any candidate")
+                    log.info(f"  🎯 {ticker}: strike {pick[1]:.1f} nearest target "
+                             f"{target_strike:.1f} @ ${pick[2]:.2f} "
+                             f"— proximity fallback ({why_prox})")
+                best = pick[0]
 
             if not best:
                 log.warning(f"No contract found for {ticker} — {len(side_options)} "
@@ -592,7 +624,13 @@ class OptionsSelector:
                 "expiry": expiry,
                 "ask": ask_price,
                 "bid": float(best.get("bid", 0)),
-                "delta": best.get("greeks", {}).get("delta"),
+                # Same null-greeks trap as the filter loop above. This one sat
+                # in the RETURN path, so it survived the first fix and threw
+                # after a contract had already been chosen — the outer
+                # `except Exception` caught it and logged a generic
+                # "Contract selection error", which reads like a broker
+                # problem rather than a null field.
+                "delta": (best.get("greeks") or {}).get("delta"),
                 "contracts": contracts,
                 "total_cost": total_cost,
                 "signal": signal
@@ -1412,7 +1450,12 @@ class OptionsAgent:
         self.ticker_cooldown: dict = {}
         self.premarket_watchlist: list = []  # populated by run_premarket_scan()
         self.last_regime_report = None       # most recent crash_mode.RegimeReport
-        self.shadow = ShadowLogger(enabled=CONFIG.get("shadow_logging", True))
+        # v5.15: stamp the config signature onto every shadow record, so a
+        # settings change (the watchlist fix above, most immediately) starts a
+        # visibly new sample instead of silently contaminating the old one.
+        self.shadow = ShadowLogger(
+            enabled=CONFIG.get("shadow_logging", True),
+            cohort=shadow_mod.config_cohort(CONFIG))
 
     # ── Regime + concurrent scan (v5) ──────────────────────────────────────
     def _regime_and_signals(self):
@@ -1441,8 +1484,44 @@ class OptionsAgent:
         ov = crash_mode.overrides_for(rep, CONFIG)
         ov["crash_mode"] = rep.regime == "crash"
         crash_mode.log_report(rep)
-        sigs = self.signals.get_top_signals(min_score=CONFIG["min_signal_score"])
+        sigs = self.signals.get_top_signals(
+            min_score=CONFIG["min_signal_score"],
+            watchlist=self._resolve_watchlist(rep.regime))
         return rep, ov, sigs
+
+    def _resolve_watchlist(self, regime: str) -> list | None:
+        """Which names to scan. None = keep signal_engine's own defaults.
+
+        v5.14 — CONFIG["watchlist"] was dead configuration.
+
+        Neither get_top_signals() nor get_top_signals_async() was ever passed a
+        watchlist, so both fell through to signal_engine.FULL_WATCHLIST:
+
+            ["SPY","QQQ","TSLA","NVDA","AMD","META","AMZN","MSFT","AAPL"]
+
+        which is precisely the 9 tickers the 2026-08-18 log scanned, and why
+        AAPL kept producing signals despite not appearing in config at all.
+        COIN, MSTR, PLTR, HOOD, RBLX, TQQQ, SOXL, SPXL and LABU had never been
+        looked at. The test suite even asserts "watchlist not emptied", which
+        made the setting look load-bearing when nothing read it.
+
+        OFF by default: turning it on changes which instruments get traded
+        with real money, and that is a decision to make deliberately.
+
+        Regime handling is deliberately conservative. The config list replaces
+        the broad bull/bear universe only. NEUTRAL still narrows to SPY/QQQ
+        and CRASH still uses CRASH_WATCHLIST, because those are risk decisions
+        about breadth, not preferences about names — and crash routing depends
+        on index names having inverse-ETF counterparts.
+        """
+        if not CONFIG.get("respect_config_watchlist", False):
+            return None
+        if regime in ("neutral", "crash"):
+            return None
+        wl = [str(t).upper().strip() for t in CONFIG.get("watchlist", []) if t]
+        if not wl:
+            return None
+        return list(dict.fromkeys(wl))
 
     async def _regime_and_signals_async(self):
         # v5.3: Tradier is the primary data source. Yahoo throttles data-centre
@@ -1485,7 +1564,7 @@ class OptionsAgent:
             trace: list = []
             sigs = await self.signals.get_top_signals_async(
                 md, min_score, regime=rep.regime, vix=rep.vix, overrides=ov,
-                trace=trace)
+                watchlist=self._resolve_watchlist(rep.regime), trace=trace)
 
             # Shadow logging: every signal the gates rejected, with the spot
             # price at that moment. shadow.py measures later what the

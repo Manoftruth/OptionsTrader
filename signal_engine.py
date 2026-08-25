@@ -737,7 +737,13 @@ class SignalEngine:
             return None
 
     # ── Top signals ────────────────────────────────────────────────────────────
-    def get_top_signals(self, min_score: int = 14) -> list:
+    def get_top_signals(self, min_score: int = 14,
+                        watchlist: list | None = None) -> list:
+        # v5.14: the sync fallback had no watchlist parameter at all, so even
+        # once the async path honoured CONFIG["watchlist"], a fallback cycle
+        # would silently revert to the hardcoded megacap list. Two scanners
+        # disagreeing about what to scan is worse than either choice.
+        _wl_override = list(watchlist) if watchlist else None
         regime = self._market_regime()
         self.last_regime = regime
         log.info(f"📊 Market regime: {regime.upper()}")
@@ -755,9 +761,11 @@ class SignalEngine:
             threshold = min_score
             log.info(f"  NEUTRAL regime — {watchlist}, min score {threshold}")
         else:
-            watchlist = FULL_WATCHLIST
+            watchlist = _wl_override or FULL_WATCHLIST
             threshold = min_score
-            log.info(f"  {regime.upper()} regime — {len(watchlist)} tickers, min score {threshold}")
+            log.info(f"  {regime.upper()} regime — {len(watchlist)} tickers "
+                     f"({'config' if _wl_override else 'built-in'}), "
+                     f"min score {threshold}")
 
         signals = []
         for ticker in watchlist:

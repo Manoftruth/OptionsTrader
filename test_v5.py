@@ -201,6 +201,22 @@ def test_vix_mult():
 
 
 # ── 4. Spread construction ─────────────────────────────────────────────────────
+
+def _exp(days: int) -> str:
+    """Expiry date `days` from today, ISO.
+
+    v5.16 — test fixtures used to hardcode 2026-08-14 / 2026-08-21. Both dates
+    fell into the past on 2026-08-25 and get_nearest_expiry() started returning
+    None, so every selector returned None and 8 checks across sections 8 and 10
+    went red at once. Nothing was broken; the fixtures had simply expired.
+
+    A suite that fails on a calendar date teaches you to distrust red, which is
+    worse than the bug it hides. Dates are relative from here on.
+    """
+    from datetime import date, timedelta
+    return (date.today() + timedelta(days=days)).isoformat()
+
+
 def put_chain(spot=500.0, tv=14.0, lo=440, hi=560, oi=800, spread_mult=1.03, step=5):
     out = []
     for k in range(lo, hi + 1, step):
@@ -211,7 +227,7 @@ def put_chain(spot=500.0, tv=14.0, lo=440, hi=560, oi=800, spread_mult=1.03, ste
             "symbol": f"OPT260814P{k:08d}", "strike": float(k),
             "option_type": "put", "bid": round(mid / spread_mult, 2),
             "ask": round(mid * spread_mult, 2), "open_interest": oi,
-            "volume": 400, "expiration_date": "2026-08-14",
+            "volume": 400, "expiration_date": _exp(2),
             "greeks": {"delta": -max(0.02, min(0.98, 0.5 + (k - spot) / (spot * 0.12)))},
         })
     return out
@@ -237,7 +253,7 @@ def itm_call_chain(spot, iv=0.85, dte=1, oi=500, spread_mult=1.04):
             "symbol": f"ETF260814C{int(k * 1000):08d}", "strike": round(k, 2),
             "option_type": "call", "bid": round(mid / spread_mult, 2),
             "ask": round(mid * spread_mult, 2), "open_interest": oi,
-            "volume": 300, "expiration_date": "2026-08-13",
+            "volume": 300, "expiration_date": _exp(max(1, int(dte))),
             "greeks": {"delta": max(0.02, min(0.98, 0.5 + (spot - k) / (spot * 0.30)))},
         })
         k += step
@@ -592,12 +608,12 @@ def test_tradier_data():
         return web.json_response({"series": {"data": data}})
 
     async def expirations(request):
-        return web.json_response({"expirations": {"date": ["2026-08-14", "2026-08-21"]}})
+        return web.json_response({"expirations": {"date": [_exp(2), _exp(9)]}})
 
     async def chains(request):
         opts = [{"symbol": f"SPY{k}", "strike": float(k), "option_type": t,
                  "bid": 1.0, "ask": 1.1, "open_interest": 500, "volume": 200,
-                 "expiration_date": "2026-08-14", "greeks": {"delta": 0.5}}
+                 "expiration_date": _exp(2), "greeks": {"delta": 0.5}}
                 for k in (760, 770, 780) for t in ("call", "put")]
         return web.json_response({"options": {"option": opts}})
 
@@ -1022,7 +1038,7 @@ class FakeBroker(FakeTradier):
                              "total_equity": 5000.0}}
 
     def get_options_expirations(self, symbol):
-        return {"expirations": {"date": ["2026-08-14", "2026-08-21"]}}
+        return {"expirations": {"date": [_exp(2), _exp(9)]}}
 
     def get_quote(self, symbol):
         # Inverse-ETF spot used by the deep-ITM router
@@ -1162,6 +1178,156 @@ def test_end_to_end():
     CONFIG["crash_structure"] = _orig_struct
 
 
+def _amd_like_chain(spot=474.0, lo=455, hi=500, step=5, dte=2):
+    """High-priced underlying where 2% OTM is a delta-0.07 lottery ticket."""
+    import math
+    out = []
+    for k in range(lo, hi + 1, step):
+        m = (k - spot) / spot
+        ext = max(0.02, spot * 0.50 * math.sqrt(dte / 365) * 0.4
+                  * math.exp(-30 * m * m))
+        mid = max(0.0, spot - k) + ext
+        out.append({
+            "symbol": f"AMD{k}", "strike": float(k), "option_type": "call",
+            "bid": round(mid / 1.04, 2), "ask": round(mid * 1.04, 2),
+            "open_interest": 500, "volume": 300,
+            "expiration_date": _exp(2),
+            "greeks": {"delta": max(0.01, min(0.99,
+                                              0.5 - (k - spot) / (spot * 0.06)))},
+        })
+    return out
+
+
+class AmdBroker(FakeTradier):
+    def get_options_expirations(self, symbol):
+        from datetime import date, timedelta as _td
+        t = date.today()
+        return {"expirations": {"date": [(t + _td(days=d)).isoformat()
+                                         for d in (2, 9)]}}
+
+    def get_options_chain(self, symbol, expiration):
+        return {"options": {"option": _amd_like_chain()}}
+
+
+def test_delta_targeting():
+    """v5.16: aim at the middle of the delta band, not at an unreachable strike.
+
+    target_strike is spot * 1.02. On AMD at $473.84 that is strike 485, which
+    carried delta 0.07 on 2026-08-25 — a value the 0.20-0.70 filter can never
+    accept. Ranking eligible contracts by distance from that point therefore
+    always favoured the contract nearest the BOTTOM of the band. The
+    affordability scan showed the fingerprint plainly: TSLA 0.21, HOOD 0.20,
+    COIN 0.23, AMD 0.21, NVDA 0.31. Every single one at the delta floor.
+    """
+    print("\n[19] Contract selection targets delta, not an unreachable strike")
+    import agent as ag
+    from config import CONFIG
+
+    sel = ag.OptionsSelector(AmdBroker())
+    sig = {"ticker": "AMD", "direction": "CALL", "price": 474.0,
+           "score": 21.0, "confluence": 4, "vix_size_mult": 1.0}
+    ov = {"max_contract_price": 30.0}
+
+    _mt = CONFIG.get("max_trade_size")
+    _dte = CONFIG.get("min_days_to_expiry")
+    _td = CONFIG.get("contract_target_delta")
+    CONFIG["max_trade_size"] = 2000.0
+    CONFIG["min_days_to_expiry"] = 0
+    try:
+        CONFIG["contract_target_delta"] = 0.45
+        new = sel.select_contract(sig, 100000.0, ov)
+        CONFIG["contract_target_delta"] = 0.0
+        old = sel.select_contract(sig, 100000.0, ov)
+
+        check("both modes still find a contract",
+              new is not None and old is not None)
+        if new and old:
+            nd, od = abs(float(new["delta"])), abs(float(old["delta"]))
+            check("delta targeting lands near the middle of the band",
+                  0.35 <= nd <= 0.55, f"delta {nd:.2f}")
+            check("old strike-proximity sat lower in the band",
+                  od < nd, f"old {od:.2f} vs new {nd:.2f}")
+            check("the extra delta is not bought with much extra premium",
+                  new["ask"] <= old["ask"] * 1.35,
+                  f"${new['ask']:.2f} vs ${old['ask']:.2f}")
+            check("still inside the delta filter",
+                  0.20 <= nd <= 0.70, f"{nd:.2f}")
+
+        # Budget must still bind ahead of the delta preference.
+        CONFIG["max_trade_size"] = 150.0
+        CONFIG["contract_target_delta"] = 0.45
+        broke = sel.select_contract(sig, 100000.0, ov)
+        check("a budget that cannot reach the band declines, not degrades",
+              broke is None, f"{broke}")
+    finally:
+        CONFIG["max_trade_size"] = _mt
+        CONFIG["min_days_to_expiry"] = _dte
+        CONFIG["contract_target_delta"] = _td
+
+
+def test_watchlist_plumbing():
+    """v5.14: CONFIG["watchlist"] was never passed to either scanner.
+
+    Both get_top_signals() and get_top_signals_async() fell through to
+    signal_engine.FULL_WATCHLIST — the 9 hardcoded megacaps that the
+    2026-08-18 log actually scanned, including AAPL, which is not in config.
+    Nine of the fourteen configured names had never been looked at.
+
+    The suite's own "watchlist not emptied" check made the setting look
+    load-bearing while nothing read it. That is the failure mode worth
+    guarding: config that appears wired up and is not.
+    """
+    print("\n[18] Config watchlist actually reaches the scanner (v5.14)")
+    import agent as ag
+    import signal_engine as se
+    from config import CONFIG
+
+    a = ag.OptionsAgent.__new__(ag.OptionsAgent)
+    _flag = CONFIG.get("respect_config_watchlist", False)
+    _wl = CONFIG.get("watchlist")
+    try:
+        CONFIG["watchlist"] = ["COIN", "MSTR", "RBLX", "coin"]
+
+        CONFIG["respect_config_watchlist"] = False
+        check("OFF → scanner keeps its built-in list (no silent change)",
+              a._resolve_watchlist("bull") is None)
+
+        CONFIG["respect_config_watchlist"] = True
+        got = a._resolve_watchlist("bull")
+        check("ON → config list reaches the scanner",
+              got == ["COIN", "MSTR", "RBLX"], f"{got}")
+        check("case-folded and de-duplicated", got is not None and len(got) == 3)
+        check("bear regime also uses the config list",
+              a._resolve_watchlist("bear") == ["COIN", "MSTR", "RBLX"])
+        check("NEUTRAL still narrows to the engine's own SPY/QQQ",
+              a._resolve_watchlist("neutral") is None)
+        check("CRASH still uses CRASH_WATCHLIST (inverse-ETF routing needs it)",
+              a._resolve_watchlist("crash") is None)
+
+        CONFIG["watchlist"] = []
+        check("empty config list falls back rather than scanning nothing",
+              a._resolve_watchlist("bull") is None)
+
+        # The sync fallback must not disagree with the async path.
+        import inspect
+        sig = inspect.signature(se.SignalEngine.get_top_signals)
+        check("sync fallback accepts a watchlist too",
+              "watchlist" in sig.parameters)
+        asig = inspect.signature(se.SignalEngine.get_top_signals_async)
+        check("async scanner accepts a watchlist", "watchlist" in asig.parameters)
+
+        # And the agent must actually pass it at both call sites.
+        src = inspect.getsource(ag.OptionsAgent._regime_and_signals_async)
+        check("async call site passes the resolved watchlist",
+              "_resolve_watchlist" in src)
+        src2 = inspect.getsource(ag.OptionsAgent._regime_and_signals)
+        check("sync call site passes the resolved watchlist",
+              "_resolve_watchlist" in src2)
+    finally:
+        CONFIG["respect_config_watchlist"] = _flag
+        CONFIG["watchlist"] = _wl
+
+
 class BalanceBroker(FakeTradier):
     """Broker with a grown account: $1,139 equity against a $500 base."""
 
@@ -1297,7 +1463,7 @@ def _priced_call_chain(spot=100.0, lo=93, hi=111):
             "symbol": f"TST260814C{k:08d}", "strike": float(k),
             "option_type": "call", "bid": round(mid / 1.03, 2),
             "ask": round(mid * 1.03, 2), "open_interest": 900,
-            "volume": 500, "expiration_date": "2026-08-14",
+            "volume": 500, "expiration_date": _exp(2),
             "greeks": {"delta": 0.5 + (spot - k) / 40.0},
         })
     return out
@@ -1343,7 +1509,13 @@ def test_budget_bounded_selection():
 
     _orig = CONFIG.get("max_trade_size")
     _orig_dte = CONFIG.get("min_days_to_expiry")
+    _orig_td = CONFIG.get("contract_target_delta")
     CONFIG["min_days_to_expiry"] = 0
+    # v5.16: pin the ranking rule off. This section tests BUDGET BOUNDING, and
+    # it should not go red because the tie-breaker changed — that is section
+    # 19's job. Leaving it unpinned is how a suite starts reporting one change
+    # as several failures.
+    CONFIG["contract_target_delta"] = 0.0
     try:
         # Roomy budget: takes the contract nearest the target strike.
         CONFIG["max_trade_size"] = 1000.0
@@ -1378,6 +1550,7 @@ def test_budget_bounded_selection():
     finally:
         CONFIG["max_trade_size"] = _orig
         CONFIG["min_days_to_expiry"] = _orig_dte
+        CONFIG["contract_target_delta"] = _orig_td
 
 
 if __name__ == "__main__":
@@ -1404,6 +1577,8 @@ if __name__ == "__main__":
     test_budget_bounded_selection()
     test_capital_scaling()
     test_null_greeks()
+    test_watchlist_plumbing()
+    test_delta_targeting()
 
     print("\n" + "=" * 64)
     print(f"PASSED {len(PASS)}   FAILED {len(FAIL)}")

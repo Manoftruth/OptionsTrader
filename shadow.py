@@ -54,11 +54,38 @@ def _path(name: str) -> Path:
     return Path(__file__).parent / name
 
 
+# Settings that change WHICH signals can exist at all. Changing any of these
+# starts a new population, and pooling across the change is not measuring one
+# thing — it is averaging two experiments.
+_COHORT_KEYS = ("respect_config_watchlist", "watchlist", "min_signal_score",
+                "score_size_curve", "use_score_sizing", "crash_mode_enabled")
+
+
+def config_cohort(cfg: dict) -> str:
+    """Short signature of the config that produced a signal.
+
+    v5.15. The first 1,235 shadow records were gathered while the scanner was
+    silently using a hardcoded megacap list, because CONFIG["watchlist"] was
+    never passed through. The moment that is fixed, signals start arriving from
+    entirely different underlyings — and an analysis that pools them will
+    happily report a hit rate for a population that never existed.
+
+    Stamping the cohort costs one hash per cycle and makes the mistake
+    detectable instead of invisible.
+    """
+    import hashlib
+    blob = json.dumps({k: cfg.get(k) for k in _COHORT_KEYS},
+                      sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode()).hexdigest()[:8]
+
+
 class ShadowLogger:
     """Append-only record of rejected signals, resolved later against bars."""
 
-    def __init__(self, enabled: bool = True, dedupe_minutes: float = 30.0):
+    def __init__(self, enabled: bool = True, dedupe_minutes: float = 30.0,
+                 cohort: str = ""):
         self.enabled = enabled
+        self.cohort = cohort or "legacy"
         # v5.8: the same signal recurs every cycle until the setup changes, so
         # one NVDA CALL got logged ~10 times in half an hour. That inflates n
         # while adding no information — the records are the same observation,
@@ -99,6 +126,7 @@ class ShadowLogger:
                         "regime": regime,
                         "vix": vix,
                         "accepted": bool(e.get("accepted", False)),
+                        "cohort": self.cohort,
                     }) + "\n")
         except Exception as ex:
             log.debug(f"shadow record failed (non-fatal): {ex}")
@@ -212,6 +240,7 @@ class ShadowLogger:
             out = {k: rec[k] for k in
                    ("ts", "ticker", "stage", "implied_direction", "score",
                     "regime", "vix", "accepted", "spot")}
+            out["cohort"] = rec.get("cohort", "legacy")
             got = False
             for h in HORIZONS_MIN:
                 target = t0 + timedelta(minutes=h)
@@ -299,7 +328,16 @@ def report() -> None:
         print("  " + "-" * 54)
         groups: dict[str, list] = {}
         for r in have:
-            k = "ACCEPTED (traded)" if r.get("accepted") else \
+            # v5.15: this said "ACCEPTED (traded)" and that was wrong. The flag
+            # is set by the scanner's trace when a signal clears the SCORING
+            # gates — before contract selection, budget sizing, TradeJudge and
+            # the risk checks. We watched AAPL clear the gates cycle after
+            # cycle on 2026-08-18 and never trade once, because no contract fit
+            # the budget. Calling that group "traded" makes it look like
+            # realised positions when it is really "signals the scanner liked".
+            # It is still the right control for measuring gate value — but only
+            # if it is named honestly.
+            k = "PASSED gates" if r.get("accepted") else \
                 f"rejected: {r.get('stage', '?')}"
             groups.setdefault(k, []).append(r[key])
         for k, v in sorted(groups.items(), key=lambda kv: -len(kv[1])):
@@ -314,8 +352,15 @@ def report() -> None:
                   f"{med:>+9.2f}{flag}")
 
     print("\n  Read it this way: if a rejection stage shows a hit rate near or")
-    print("  above ACCEPTED, that gate is throwing away good signals. If it")
+    print("  above PASSED, that gate is throwing away good signals. If it")
     print("  sits well below 50%, the gate is earning its keep.")
+    print("\n  These are point estimates with NO intervals. A hit rate of 41%")
+    print("  on n=153 has a 95% interval of roughly [34%, 49%] — and the same")
+    print("  gate already read 23%, then 48%, then 41% across three samples.")
+    print("  Before acting on anything here, run:")
+    print("      ./venv/bin/python shadow_stats.py")
+    print("  which puts intervals on every row and corrects for the fact that")
+    print("  this table runs ~15 simultaneous tests.")
 
 
 if __name__ == "__main__":
