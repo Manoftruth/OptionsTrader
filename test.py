@@ -8,6 +8,25 @@ spreads, async_data or the PositionMonitor changes.
 
     python3 test_v5.py
 """
+import os as _os
+import tempfile as _tempfile
+
+# ── v5.21: isolate runtime state BEFORE importing anything ──────────────────
+#
+# The suite runs in the same directory as the live agent. Once v5.17 made the
+# daily risk baseline persistent, RiskManager.__init__ began loading the
+# PRODUCTION risk_state.json — so the fake broker's $500 balance was measured
+# against the real account's $798.30 morning baseline, the kill switch fired
+# at a phantom -37%, and eight order-placing checks failed with no visible
+# cause. The tests were reporting on the live account, not on the code.
+#
+# Worse than the false failures: the suite could also WRITE those files, so a
+# test run would have edited the live agent's risk and regime memory.
+#
+# This must run before `import agent`, because the path is resolved when the
+# RiskManager is constructed.
+_os.environ["OPTIONSTRADER_STATE_DIR"] = _tempfile.mkdtemp(prefix="ot-test-state-")
+
 import asyncio
 import json
 import sys
@@ -1265,6 +1284,172 @@ def test_delta_targeting():
         CONFIG["contract_target_delta"] = _td
 
 
+def test_crash_path_ignores_min_price():
+    """min_contract_price must not touch the crash structures.
+
+    The 296-trade analysis says contracts under $1.00 win 31% against a 38.2%
+    breakeven, so the floor rises to $1.00. That is a fix for the plain
+    single-leg path, where a small budget was shopping in the cheapest,
+    widest-spread, lowest-delta corner of the chain.
+
+    The crash path is the opposite trade by design — deep ITM, delta 0.60-0.92,
+    extrinsic capped at 40% — and must stay unaffected. Nothing in deep_itm.py
+    or spreads.py reads min_contract_price today. This pins that, because the
+    two paths look similar enough that a future refactor could reasonably
+    "unify" the price filters and silently break the recession strategy.
+    """
+    print("\n[21] min_contract_price must not reach the crash path")
+    import inspect
+    import deep_itm as di
+    import spreads as sp
+    from config import CONFIG
+
+    for mod in (di, sp):
+        check(f"{mod.__name__} does not read min_contract_price",
+              "min_contract_price" not in inspect.getsource(mod))
+
+    # Behavioural, not merely textual: the floor must not change the pick.
+    spot = 38.17
+    chain = itm_call_chain(spot, iv=0.85, dte=1)
+    _orig = CONFIG.get("min_contract_price")
+    try:
+        CONFIG["min_contract_price"] = 0.20
+        low = di.build_deep_itm(chain, spot, "CALL", 600.0,
+                                CONFIG.get("deep_itm_cfg"))
+        CONFIG["min_contract_price"] = 1.00
+        high = di.build_deep_itm(chain, spot, "CALL", 600.0,
+                                 CONFIG.get("deep_itm_cfg"))
+        check("deep ITM picks the same contract at either floor",
+              low is not None and high is not None
+              and low["strike"] == high["strike"],
+              f"{low and low['strike']} vs {high and high['strike']}")
+        if high:
+            check("and that contract is far above a $1.00 floor anyway",
+                  high["ask"] > 1.00, f"${high['ask']:.2f}")
+            check("its premium is mostly intrinsic, not time value",
+                  high["extrinsic_pct"] <= 40.0,
+                  f"{high['extrinsic_pct']:.0f}% extrinsic")
+    finally:
+        CONFIG["min_contract_price"] = _orig
+
+
+def test_daily_risk_persistence():
+    """v5.17: the daily loss limit must survive `systemctl restart`.
+
+    _start_of_day_capital and _killed_today were in-memory only, and
+    _reset_if_new_day re-baselines whenever _last_reset_date != today — which
+    on a fresh process is None. So every restart moved the baseline to the
+    CURRENT (post-loss) balance and cleared the kill switch.
+
+    Caught live on 2026-08-25:
+        10:12  Day P&L: $-83.80 (-9.5%)
+        11:28  Day P&L: $+0.00 (+0.0%)    identical balance, $798.30
+
+    Restart three times on a bad day and a 14% daily limit silently permits
+    42%. This is the control that stops a bad day compounding, and it was
+    defeated by the deploy procedure we had been using all session.
+    """
+    print("\n[20] Daily loss baseline survives a restart (v5.17)")
+    import json as _json
+    import os as _os
+    import agent as ag
+    from config import CONFIG
+
+    class Bal:
+        def __init__(self, eq):
+            self.eq = eq
+
+        def get_account_balances(self):
+            return {"balances": {"cash": {"cash_available": self.eq},
+                                 "total_equity": self.eq}}
+
+    _sb, _cl = CONFIG.get("sandbox"), CONFIG.get("capital_limit")
+    CONFIG["sandbox"] = False
+    CONFIG["capital_limit"] = 500.0
+    state = ag.RiskManager(Bal(1.0))._state_path()
+    backup = state.read_text() if state.exists() else None
+    try:
+        if state.exists():
+            _os.remove(state)
+
+        b = Bal(882.10)
+        r1 = ag.RiskManager(b)
+        r1.check_daily_loss_limit(882.10)
+        check("baseline set on first run of the day",
+              abs(r1._start_of_day_capital - 882.10) < 0.01)
+        check("state written to disk", state.exists())
+
+        b.eq = 798.30                       # down $83.80
+        r1.check_daily_loss_limit(798.30)
+
+        r2 = ag.RiskManager(b)              # ← the restart
+        check("restart RESTORES the morning baseline, not the current balance",
+              r2._start_of_day_capital is not None
+              and abs(r2._start_of_day_capital - 882.10) < 0.01,
+              f"{r2._start_of_day_capital}")
+        check("the day's loss is still counted after a restart",
+              abs((r2._start_of_day_capital - 798.30) - 83.80) < 0.01)
+
+        b.eq = 640.0                        # blow through the 14% limit
+        killed, _ = r2.check_daily_loss_limit(640.0)
+        check("kill switch fires on a large loss", killed)
+
+        r3 = ag.RiskManager(b)
+        check("a restart does NOT un-kill the switch", r3._killed_today)
+        again, msg = r3.check_daily_loss_limit(640.0)
+        check("still refuses to trade after the restart", again, msg[:40])
+
+        # A stale file must not freeze yesterday's baseline onto today.
+        state.write_text(_json.dumps({"date": "2020-01-01",
+                                      "start_capital": 1.0, "killed": True}))
+        r4 = ag.RiskManager(b)
+        check("yesterday's state is ignored, not inherited",
+              r4._start_of_day_capital is None and not r4._killed_today)
+
+        # Corrupt file must degrade, not crash the agent on boot.
+        state.write_text("{not json")
+        r5 = ag.RiskManager(b)
+        check("corrupt state file does not prevent startup",
+              r5._start_of_day_capital is None)
+
+        # v5.18: the day must roll over even when nothing ever trades.
+        #
+        # _reset_if_new_day was reachable only via can_trade(), which needs a
+        # candidate that survived scoring, selection AND sizing. On a day where
+        # nothing gets that far the baseline never rolled, so "Day P&L" kept
+        # displaying YESTERDAY's loss and the kill switch compared today's
+        # balance against a stale reference.
+        if state.exists():
+            _os.remove(state)
+        import datetime as _dt
+        yday = (_dt.date.today() - _dt.timedelta(days=1)).isoformat()
+        state.write_text(_json.dumps({"date": yday, "start_capital": 882.10,
+                                      "killed": False}))
+        quiet = ag.RiskManager(Bal(798.30))
+        check("a stale-dated baseline is not carried into today",
+              quiet._start_of_day_capital is None)
+        # This is exactly the call run_once now makes on every cycle.
+        quiet.check_daily_loss_limit(798.30)
+        check("the day rolls over with NO trade candidate involved",
+              quiet._start_of_day_capital is not None
+              and abs(quiet._start_of_day_capital - 798.30) < 0.01,
+              f"{quiet._start_of_day_capital}")
+        check("today's P&L therefore reads flat, not yesterday's -$83.80",
+              abs(798.30 - quiet._start_of_day_capital) < 0.01)
+
+        import inspect
+        src = inspect.getsource(ag.OptionsAgent.run_once)
+        check("run_once evaluates the kill switch every cycle",
+              "check_daily_loss_limit" in src)
+    finally:
+        CONFIG["sandbox"] = _sb
+        CONFIG["capital_limit"] = _cl
+        if backup is not None:
+            state.write_text(backup)
+        elif state.exists():
+            _os.remove(state)
+
+
 def test_watchlist_plumbing():
     """v5.14: CONFIG["watchlist"] was never passed to either scanner.
 
@@ -1553,6 +1738,100 @@ def test_budget_bounded_selection():
         CONFIG["contract_target_delta"] = _orig_td
 
 
+def test_regime_state_machine():
+    """v5.20: NORMAL → CRASH → RECOVERY → NORMAL, with memory.
+
+    crash_mode.assess() is stateless. It re-derives the regime from vote counts
+    every cycle, so the instant votes fall from 2 to 1 the classifier returns
+    BULL and the agent resumes buying calls. Bear-market rallies are the
+    sharpest rallies there are — Oct/Nov 2008 held several +10% bounces inside
+    a -40% decline — so a stateless classifier buys the top of each one.
+
+    Entering CRASH is one cycle (late is the expensive error). Leaving it takes
+    sustained calm, then several distinct clean TRADING DAYS before normal
+    trading resumes (early is the expensive error there).
+    """
+    print("\n[22] Regime state machine (v5.20)")
+    import os as _os
+    import regime_state as rs
+
+    class Rep:
+        def __init__(self, regime, votes):
+            self.regime, self.crash_votes = regime, votes
+
+    cfg = {"crash_exit_votes": 1, "crash_exit_cycles": 3,
+           "recovery_confirm_days": 3, "recovery_max_vix": 22.0,
+           "recovery_max_term": 0.95, "recovery_require_uptrend": True}
+    path = rs._path()
+    backup = path.read_text() if path.exists() else None
+    try:
+        if path.exists():
+            _os.remove(path)
+        m = rs.RegimeState(cfg)
+
+        check("calm market passes through untouched",
+              m.update(Rep("bull", 0), 15.6, 0.85, True, "2026-09-01") == "bull")
+
+        check("a crash arms in ONE cycle",
+              m.update(Rep("crash", 3), 38.0, 1.25, False, "2026-09-02") == "crash")
+
+        # The bounce. This is the case the whole module exists for.
+        e1 = m.update(Rep("bull", 1), 26.0, 1.02, False, "2026-09-03")
+        e2 = m.update(Rep("bull", 1), 25.0, 0.99, False, "2026-09-03")
+        check("a bounce does NOT flip straight back to bull",
+              e1 == "crash" and e2 == "crash", f"{e1}/{e2}")
+
+        m.update(Rep("crash", 2), 33.0, 1.12, False, "2026-09-04")
+        check("a failed bounce resets the calm counter", m.calm_cycles == 0)
+
+        outs = [m.update(Rep("bull", 0), 24.0, 0.97, False, "2026-09-08")
+                for _ in range(3)]
+        check("sustained calm moves CRASH → RECOVERY",
+              outs[-1] == "recovery", f"{outs}")
+
+        check("RECOVERY blocks BOTH directions, not just calls",
+              (lambda o: o["allow_calls"] is False and o["allow_puts"] is False
+               and o["size_mult"] == 0.0)(
+                  m.apply("recovery", {"allow_calls": True, "allow_puts": True,
+                                       "size_mult": 1.0})))
+
+        m.update(Rep("bull", 0), 24.0, 0.93, True, "2026-09-09")
+        check("VIX still elevated earns no confirmation day",
+              len(m.confirm_days) == 0)
+
+        m.update(Rep("bull", 0), 19.0, 0.90, True, "2026-09-10")
+        m.update(Rep("bull", 0), 19.0, 0.90, True, "2026-09-10")
+        check("confirmation counts DAYS, not cycles",
+              len(m.confirm_days) == 1, f"{m.confirm_days}")
+
+        m.update(Rep("bull", 0), 18.0, 0.88, True, "2026-09-11")
+        m.update(Rep("bull", 0), 19.5, 0.91, False, "2026-09-14")
+        check("losing the uptrend resets confirmation to zero",
+              len(m.confirm_days) == 0)
+
+        for d in ("2026-09-15", "2026-09-16"):
+            m.update(Rep("bull", 0), 17.0, 0.86, True, d)
+        final = m.update(Rep("bull", 0), 16.0, 0.84, True, "2026-09-17")
+        check("three clean sessions restore normal trading",
+              final == "bull" and m.state == "normal", f"{final}/{m.state}")
+
+        # A crash must re-arm from RECOVERY without waiting for anything.
+        m.update(Rep("crash", 3), 40.0, 1.30, False, "2026-09-18")
+        m.update(Rep("bull", 0), 20.0, 0.90, True, "2026-09-21")
+        check("state survives a restart mid-crash",
+              rs.RegimeState(cfg).state == "crash")
+
+        # Disabled → pure passthrough, no behaviour change.
+        off = rs.RegimeState({**cfg, "regime_state_machine": False})
+        check("disabling it is a true passthrough",
+              off.update(Rep("bull", 1), 30.0, 1.2, False, "2026-09-22") == "bull")
+    finally:
+        if backup is not None:
+            path.write_text(backup)
+        elif path.exists():
+            _os.remove(path)
+
+
 if __name__ == "__main__":
     print("=" * 64)
     print("OptionsAgent v5 — offline verification")
@@ -1579,6 +1858,9 @@ if __name__ == "__main__":
     test_null_greeks()
     test_watchlist_plumbing()
     test_delta_targeting()
+    test_daily_risk_persistence()
+    test_crash_path_ignores_min_price()
+    test_regime_state_machine()
 
     print("\n" + "=" * 64)
     print(f"PASSED {len(PASS)}   FAILED {len(FAIL)}")

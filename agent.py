@@ -43,6 +43,7 @@ import crash_mode
 import deep_itm
 import scoring
 import shadow as shadow_mod
+import regime_state as regime_state_mod
 from shadow import ShadowLogger
 import spreads as spreads_mod
 from async_data import AsyncMarketData, AIOHTTP_AVAILABLE
@@ -258,6 +259,7 @@ class OptionsSelector:
         log.info(f"  💵 Deep ITM budget: ${budget:.0f} "
                  f"({'crash_max_trade_size' if explicit else 'sized from max_trade_size'})")
 
+        candidates: list[dict] = []
         for etf in underlyings:
             try:
                 q = self.client.get_quote(etf)
@@ -291,39 +293,79 @@ class OptionsSelector:
                         continue
 
                     dte = (datetime.strptime(exp, "%Y-%m-%d").date() - today).days
-                    log.info(
-                        f"  🔄 Routing {signal['ticker']} PUT signal → "
-                        f"{etf} CALL (inverse ETF, level 2). "
-                        f"{dte}DTE, {pick['extrinsic_pct']:.0f}% of the premium "
-                        f"is volatility value."
-                    )
-                    if etf != underlyings[0]:
-                        log.info(f"  ↩️  Note: {underlyings[0]} had no reachable "
-                                 f"structure at ${budget:.0f}; used {etf} instead.")
 
-                    return {
-                        "ticker":        etf,
-                        "direction":     "CALL",
-                        "structure":     "deep_itm",
-                        "option_symbol": pick["option_symbol"],
-                        "strike":        pick["strike"],
-                        "expiry":        exp,
-                        "ask":           pick["ask"],
-                        "bid":           pick["bid"],
-                        "delta":         pick["delta"],
-                        "contracts":     pick["contracts"],
-                        "total_cost":    pick["total_cost"],
-                        "deep_itm":      pick,
-                        "source_signal_ticker": signal["ticker"],
-                        "signal":        signal,
-                    }
+                    # v5.19: score it and keep looking.
+                    #
+                    # This used to `return` on the FIRST reachable structure,
+                    # so crash_underlyings order decided the trade. Measured
+                    # live 2026-08-25 at a $250 budget:
+                    #
+                    #   SQQQ  $2.37 on $39.53 spot (6.0%)  1x  $237  →  +$560
+                    #   SPXS  $0.99 on $24.82 spot (4.0%)  2x  $198  →  +$712
+                    #
+                    # at an identical 5% index drop. SPXS returned MORE while
+                    # deploying LESS, because its premium is a smaller fraction
+                    # of spot — more delta exposure per dollar. SQQQ won only
+                    # because it is listed first.
+                    #
+                    # The metric is notional delta exposure per dollar spent,
+                    # which is what actually converts an index move into P&L.
+                    exposure = (pick["contracts"] * 100 * pick["delta"] * spot)
+                    eff = exposure / pick["total_cost"] if pick["total_cost"] else 0
+                    candidates.append({
+                        "eff": eff, "etf": etf, "exp": exp, "dte": dte,
+                        "spot": spot, "pick": pick,
+                    })
+                    log.info(f"  🧮 {etf} {dte}DTE: {pick['contracts']}x @ "
+                             f"${pick['ask']:.2f} = ${pick['total_cost']:.0f}, "
+                             f"delta {pick['delta']:.2f}, "
+                             f"ext {pick['extrinsic_pct']:.0f}% → "
+                             f"{eff:.1f}x exposure per dollar")
             except Exception as e:
                 log.warning(f"Deep ITM selection error on {etf}: {e}")
 
-        log.info(f"  ⬜ No deep ITM structure reachable at ${budget:.0f} across "
-                 f"{underlyings}. Raise max_trade_size or add a cheaper inverse "
-                 f"ETF to crash_underlyings.")
-        return None
+        if not candidates:
+            log.info(f"  ⬜ No deep ITM structure reachable at ${budget:.0f} across "
+                     f"{underlyings}. Raise crash_max_trade_size or add a cheaper "
+                     f"inverse ETF to crash_underlyings.")
+            return None
+
+        if CONFIG.get("crash_pick_best", True) and len(candidates) > 1:
+            best = max(candidates, key=lambda c: c["eff"])
+            first = candidates[0]
+            if best is not first:
+                log.info(f"  🏆 {best['etf']} beats {first['etf']} on exposure "
+                         f"per dollar ({best['eff']:.1f}x vs {first['eff']:.1f}x)"
+                         f" — taking {best['etf']}")
+        else:
+            best = candidates[0]
+
+        etf, exp, dte, pick = best["etf"], best["exp"], best["dte"], best["pick"]
+        log.info(
+            f"  🔄 Routing {signal['ticker']} PUT signal → {etf} CALL "
+            f"(inverse ETF, level 2). {dte}DTE, "
+            f"{pick['extrinsic_pct']:.0f}% of the premium is volatility value."
+        )
+        if etf != underlyings[0]:
+            log.info(f"  ↩️  Note: {underlyings[0]} was not chosen "
+                     f"(unreachable at ${budget:.0f}, or less efficient).")
+
+        return {
+            "ticker":        etf,
+            "direction":     "CALL",
+            "structure":     "deep_itm",
+            "option_symbol": pick["option_symbol"],
+            "strike":        pick["strike"],
+            "expiry":        exp,
+            "ask":           pick["ask"],
+            "bid":           pick["bid"],
+            "delta":         pick["delta"],
+            "contracts":     pick["contracts"],
+            "total_cost":    pick["total_cost"],
+            "deep_itm":      pick,
+            "source_signal_ticker": signal["ticker"],
+            "signal":        signal,
+        }
 
     def select_spread(self, signal: dict, capital: float,
                       overrides: dict | None = None) -> Optional[dict]:
@@ -657,8 +699,68 @@ class RiskManager:
         self._start_of_day_capital: float = None
         self._last_reset_date: str = None
         self._killed_today: bool = False
+        self._load_day_state()      # v5.17 — survive a restart
         self._vix_cache: tuple = (0, 0.0)
         self._spy_cache: tuple = (0, 0.0)
+
+    # ── daily risk state, persisted (v5.17) ───────────────────────────────
+    #
+    # _start_of_day_capital and _killed_today used to live only in memory.
+    # _reset_if_new_day fires whenever _last_reset_date != today, and on a
+    # fresh process that is None — so EVERY RESTART re-baselined the day and
+    # cleared the kill switch.
+    #
+    # Observed live 2026-08-25:
+    #     10:12  Day P&L: $-83.80 (-9.5%)
+    #     11:28  Day P&L: $+0.00 (+0.0%)     same balance, $798.30
+    #
+    # The account had not recovered a cent. A restart had simply moved the
+    # baseline down to the post-loss value, handing the agent a fresh 14%
+    # allowance. Restart it three times on a bad day and the "daily loss
+    # limit" permits 42%. This is the one control that is supposed to stop a
+    # bad day becoming a catastrophic one, and it was defeated by systemctl.
+    _STATE_FILE = "risk_state.json"
+
+    def _state_path(self) -> Path:
+        # v5.21: tests run in the same directory as the live agent, so a
+        # production risk_state.json was being loaded by the offline suite.
+        # The fake broker's $500 balance then compared against the REAL
+        # account's baseline, the kill switch fired at a phantom -37%, and
+        # eight order-placing checks failed with no explanation. State that
+        # persists must be redirectable, or it leaks into everything that
+        # imports the module.
+        base = os.environ.get("OPTIONSTRADER_STATE_DIR")
+        return (Path(base) if base else Path(__file__).parent) / self._STATE_FILE
+
+    def _load_day_state(self) -> None:
+        """Restore today's baseline across a restart. Never raises."""
+        try:
+            p = self._state_path()
+            if not p.exists():
+                return
+            d = json.loads(p.read_text())
+            today = datetime.now().date().isoformat()
+            if d.get("date") != today:
+                return                      # yesterday's state, correctly ignored
+            self._start_of_day_capital = float(d["start_capital"])
+            self._last_reset_date = today
+            self._killed_today = bool(d.get("killed", False))
+            log.info(f"   🛡️  Restored today's risk baseline "
+                     f"${self._start_of_day_capital:.2f} from disk"
+                     f"{' — KILL SWITCH STILL ACTIVE' if self._killed_today else ''}")
+        except Exception as e:
+            log.warning(f"Could not restore daily risk state ({e}) — "
+                        f"baseline will reset, which UNDERSTATES today's loss.")
+
+    def _save_day_state(self) -> None:
+        try:
+            self._state_path().write_text(json.dumps({
+                "date": self._last_reset_date,
+                "start_capital": self._start_of_day_capital,
+                "killed": self._killed_today,
+            }))
+        except Exception as e:
+            log.warning(f"Could not persist daily risk state ({e})")
 
     def _reset_if_new_day(self, current_capital: float):
         today = datetime.now().date().isoformat()
@@ -666,6 +768,7 @@ class RiskManager:
             self._start_of_day_capital = current_capital
             self._last_reset_date = today
             self._killed_today = False
+            self._save_day_state()
             log.info(f"New trading day. Starting capital: ${current_capital:.2f} | "
                      f"Daily loss limit: ${self._dynamic_daily_loss_limit():.2f}")
 
@@ -823,6 +926,7 @@ class RiskManager:
 
         if daily_loss >= self._dynamic_daily_loss_limit():
             self._killed_today = True
+            self._save_day_state()      # v5.17 — a restart must not un-kill it
             msg = (f"KILL SWITCH FIRED — portfolio down ${daily_loss:.2f} "
                    f"({daily_loss_pct:.1f}%) from day start. "
                    f"No more trades today. (limit: ${self._dynamic_daily_loss_limit():.2f})")
@@ -1456,6 +1560,8 @@ class OptionsAgent:
         self.shadow = ShadowLogger(
             enabled=CONFIG.get("shadow_logging", True),
             cohort=shadow_mod.config_cohort(CONFIG))
+        # v5.20 — persistent NORMAL → CRASH → RECOVERY machine
+        self.regime_state = regime_state_mod.RegimeState(CONFIG)
 
     # ── Regime + concurrent scan (v5) ──────────────────────────────────────
     def _regime_and_signals(self):
@@ -1483,6 +1589,9 @@ class OptionsAgent:
         rep.reasons.append("⚠️ Sync fallback — crash detection unavailable this cycle")
         ov = crash_mode.overrides_for(rep, CONFIG)
         ov["crash_mode"] = rep.regime == "crash"
+        _eff = self.regime_state.update(rep, rep.vix, rep.term_structure,
+                                        not rep.ema_fast_cross_down)
+        ov = self.regime_state.apply(_eff, ov)
         crash_mode.log_report(rep)
         sigs = self.signals.get_top_signals(
             min_score=CONFIG["min_signal_score"],
@@ -1554,6 +1663,19 @@ class OptionsAgent:
 
             ov = crash_mode.overrides_for(rep, CONFIG)
             ov["crash_mode"] = rep.regime == "crash"
+
+            # v5.20: crash_mode.assess() is stateless — it re-derives the
+            # regime from scratch every cycle. The moment votes fall from 2 to
+            # 1 it returns to BULL and the agent buys calls again on the next
+            # pass. Bear-market rallies are the sharpest rallies there are, so
+            # that is precisely when it would be buying.
+            effective = self.regime_state.update(
+                rep, rep.vix, rep.term_structure, not rep.ema_fast_cross_down)
+            if effective != rep.regime:
+                log.warning(f"🧭 Regime state machine overrides "
+                            f"{rep.regime.upper()} → {effective.upper()}")
+            ov = self.regime_state.apply(effective, ov)
+
             log.info(f"🎛️  Rules: {ov.get('reason','')} | "
                      f"calls={ov.get('allow_calls')} puts={ov.get('allow_puts')} "
                      f"size={ov.get('size_mult'):.2f}x "
@@ -1685,6 +1807,28 @@ class OptionsAgent:
         log.info("=" * 60)
         log.info(f"[CYCLE] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         balance = self.risk.get_account_balance()
+
+        # v5.18: roll the day over HERE, every cycle.
+        #
+        # _reset_if_new_day was reachable only through can_trade(), which runs
+        # only once a trade candidate has survived scoring, contract selection
+        # and sizing. On any day where nothing gets that far — most of this
+        # week — the daily baseline never rolled over at all.
+        #
+        # That is what produced this on 2026-08-25:
+        #     10:12  Day P&L: $-83.80 (-9.5%)
+        # The $83.80 was YESTERDAY's loss. The baseline was still yesterday's
+        # opening balance because no candidate had reached can_trade() since.
+        # The displayed "Day P&L" was wrong, and worse, the kill switch was
+        # measuring today's balance against a stale reference — it can both
+        # fire on a loss that already happened and fail to fire on one that is
+        # happening now.
+        #
+        # Evaluating it every cycle also means an account bleeding out through
+        # OPEN positions trips the switch, rather than only an account that
+        # happens to find something new to buy.
+        self.risk.check_daily_loss_limit(self.risk.get_available_capital())
+
         start = self.risk._start_of_day_capital or balance
         day_pnl = balance - start
         day_pnl_pct = (day_pnl / start * 100) if start > 0 else 0

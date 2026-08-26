@@ -51,7 +51,8 @@ HORIZONS_MIN = (30, 60, 90)
 
 
 def _path(name: str) -> Path:
-    return Path(__file__).parent / name
+    base = os.environ.get("OPTIONSTRADER_STATE_DIR")
+    return (Path(base) if base else Path(__file__).parent) / name
 
 
 # Settings that change WHICH signals can exist at all. Changing any of these

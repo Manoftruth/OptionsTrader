@@ -13,3 +13,8 @@ entry_prices.json.spreads
 trade_results.json
 trades.json
 venv/
+
+risk_state.json
+regime_state.json
+shadow_pending.jsonl
+shadow_resolved.jsonl
