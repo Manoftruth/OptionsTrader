@@ -18,3 +18,4 @@ risk_state.json
 regime_state.json
 shadow_pending.jsonl
 shadow_resolved.jsonl
+equity_floor_tripped.json

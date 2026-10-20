@@ -293,3 +293,19 @@ The bet is that the 25% stop caps that tail on the long PUT. Not proven.
 Judge it with `./venv/bin/python fade_study.py` (realised P&L, FADE vs PUT
 vs CALL). Verdict after 30+ fade trades; stop at once if net is negative.
 Off switch: `fade_calls: False`, then restart after the close.
+
+## v5.25 — 2026-10-20: equity floor and phone alerts
+
+- `equity_floor` (config, owner chose $100): once Tradier equity is below it,
+  new entries stop and STAY stopped across restarts until
+  `equity_floor_tripped.json` is deleted. Exits keep running. An unreadable
+  balance blocks entries for that cycle but does not trip the persistent halt.
+  Note: long options cannot take the account negative; $100 allows ~$509 of loss.
+- `alerts.py` pushes to ntfy.sh topic `alert_ntfy_topic` (config.py, private).
+  Alerts: kill switch (high), floor trip (urgent), positions open after the
+  close (urgent), any log line containing "CHECK MANUALLY" / "manual
+  intervention" (urgent, via AlertLogHandler), main-loop error (high), agent
+  start and day summary (low). Identical alerts deduped for 30 min. Never blocks.
+- The day summary now runs once after the session closes (`_after_close`),
+  replacing the 16:00-16:05 window, so early closes are covered.
+- `_sandbox.py` sets OPTIONSTRADER_ALERTS=0: tests never send.

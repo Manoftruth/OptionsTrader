@@ -427,3 +427,133 @@ try:
 except Exception as e:
     print(f"  ❌ TEST 4 FAILED: {e}")
     import traceback; traceback.print_exc()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  v5.25 — equity floor and phone alerts
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 60)
+print("  TEST 5: v5.25 — equity floor and alerts")
+print("=" * 60)
+
+_v525_fails = []
+
+
+def _v525(label, cond, detail=""):
+    print(f"  {'✅' if cond else '❌'} {label}" + (f"  — {detail}" if detail else ""))
+    if not cond:
+        _v525_fails.append(label)
+
+
+try:
+    import os as _os
+    import agent as ag
+    import alerts
+    from config import CONFIG
+
+    _v525("the sandbox disables alerts, so tests never reach the phone",
+          alerts.enabled() is False)
+
+    sent = []
+    _real_send = alerts.send
+    alerts.send = lambda *a, **k: sent.append((a, k)) or True
+
+    class _Bal:
+        def __init__(self, eq): self.eq = eq
+        def get_account_balances(self):
+            if self.eq is None:
+                raise RuntimeError("simulated outage")
+            return {"balances": {"total_equity": self.eq}}
+
+    orig = {k: CONFIG.get(k) for k in ("equity_floor", "sandbox")}
+    CONFIG["equity_floor"], CONFIG["sandbox"] = 100.0, False
+    rm = ag.RiskManager.__new__(ag.RiskManager)
+    rm._floor_path().unlink(missing_ok=True)
+
+    rm.client = _Bal(250.0)
+    halted, why = rm.check_equity_floor()
+    _v525("above the floor: trading continues", not halted, why)
+
+    rm.client = _Bal(None)
+    halted, why = rm.check_equity_floor()
+    _v525("equity unreadable: no entries (fails closed, not $500 fallback)", halted, why)
+    _v525("an unreadable balance does NOT trip the persistent halt",
+          not rm._floor_path().exists())
+
+    rm.client = _Bal(99.0)
+    halted, why = rm.check_equity_floor()
+    _v525("below the floor: halted", halted, why)
+    _v525("the halt is written to disk", rm._floor_path().exists())
+    _v525("tripping the floor sends an urgent alert",
+          any("floor" in a[0].lower() and k.get("priority") == "urgent" for a, k in sent))
+
+    rm.client = _Bal(5000.0)
+    halted, why = rm.check_equity_floor()
+    _v525("the halt survives a recovery until the file is deleted", halted, why)
+    rm._floor_path().unlink()
+    halted, _ = rm.check_equity_floor()
+    _v525("deleting the file resumes trading", not halted)
+
+    CONFIG["equity_floor"] = None
+    rm.client = _Bal(1.0)
+    _v525("equity_floor None disables it", rm.check_equity_floor() == (False, "OK"))
+    rm._floor_path().unlink(missing_ok=True)
+    CONFIG.update(orig)
+
+    # ── after the close: summary + overnight check ────────────────────────
+    a = ag.OptionsAgent.__new__(ag.OptionsAgent)
+    a.trades_today = [{"ticker": "SPY", "direction": "PUT", "contracts": 1,
+                       "option_symbol": "SPYP", "ask": 0.8, "total_cost": 80.0}]
+    a.risk = ag.RiskManager.__new__(ag.RiskManager)
+    a.risk.get_account_balance = lambda: 620.0
+    a.risk._start_of_day_capital = 609.0
+    a.risk.get_open_position_count = lambda: 1
+    sent.clear()
+    a._after_close()
+    titles = [x[0][0] for x in sent]
+    _v525("after close: a day summary is sent",
+          any("summary" in t for t in titles) and "+11.00" in sent[0][0][1], titles)
+    _v525("after close: a leftover position raises an URGENT alert",
+          any("open after close" in a_[0] and k.get("priority") == "urgent"
+              for a_, k in sent))
+    _v525("after close: today's trade list is cleared", a.trades_today == [])
+    a.risk.get_open_position_count = lambda: 0
+    sent.clear()
+    a._after_close()
+    _v525("after close, flat: summary only, no overnight alert",
+          [x[0][0] for x in sent] == ["OptionsAgent: day summary"])
+
+    # ── log lines that ask for a human go to the phone ────────────────────
+    sent.clear()
+    ag.log.error("❌ Could not get bid for X — manual intervention needed")
+    ag.log.info("ordinary info line")
+    _v525("a 'manual intervention' log line becomes an urgent alert",
+          len(sent) == 1 and sent[0][1].get("priority") == "urgent")
+    alerts.send = _real_send
+
+    # ── dedupe, with sending forced on but the network stubbed ────────────
+    posts = []
+    _env = _os.environ.pop("OPTIONSTRADER_ALERTS")
+    _cfg = {k: CONFIG.get(k) for k in ("alerts_enabled", "alert_ntfy_topic")}
+    CONFIG["alerts_enabled"], CONFIG["alert_ntfy_topic"] = True, "test-topic"
+    _post = alerts.requests.post
+    alerts.requests.post = lambda *a, **k: posts.append(a)
+    alerts._last_sent.clear()
+    first = alerts.send("t", "same message")
+    second = alerts.send("t", "same message")
+    import time as _t; _t.sleep(0.2)
+    _v525("identical alerts within 30 min are sent once",
+          first and not second and len(posts) == 1)
+    _v525("alerts go to the configured topic", posts and posts[0][0].endswith("/test-topic"))
+    alerts.requests.post = _post
+    CONFIG.update(_cfg)
+    _os.environ["OPTIONSTRADER_ALERTS"] = _env
+
+    if _v525_fails:
+        print(f"\n  ❌ TEST 5 FAILED: {len(_v525_fails)} check(s): {_v525_fails}")
+    else:
+        print("\n  ✅ TEST 5 PASSED\n")
+
+except Exception as e:
+    print(f"  ❌ TEST 5 FAILED: {e}")
+    import traceback; traceback.print_exc()

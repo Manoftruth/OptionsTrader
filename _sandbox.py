@@ -77,6 +77,8 @@ for name in FIXTURES:
         shutil.copy(src, SANDBOX)
 os.chdir(SANDBOX)
 os.environ["OPTIONSTRADER_STATE_DIR"] = SANDBOX
+# alerts.py: tests must never push to the owner's phone.
+os.environ["OPTIONSTRADER_ALERTS"] = "0"
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 print(f"[sandbox] cwd={SANDBOX}")

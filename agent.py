@@ -72,6 +72,11 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 log = logging.getLogger("OptionsAgent")
 
+# v5.25: any log line asking for manual action ("CHECK MANUALLY", ...) also
+# goes to the owner's phone. See alerts.py.
+import alerts
+log.addHandler(alerts.AlertLogHandler())
+
 
 def _state_dir() -> Path:
     """Directory for files that persist across runs.
@@ -992,6 +997,60 @@ class RiskManager:
             log.error(f"Balance fetch error: {e}")
             return float(CONFIG["capital_limit"])
 
+    def get_equity_strict(self) -> float | None:
+        """Account equity, or None if Tradier could not be read.
+
+        get_account_balance() falls back to capital_limit on any error, which
+        is fine for display but would make the equity floor fail OPEN: a
+        broker outage would report $500 and pass a $100 floor. The floor
+        uses this instead and treats None as "unknown, no entries".
+        """
+        if CONFIG.get("sandbox", True):
+            return float(CONFIG["capital_limit"])
+        try:
+            balances = (self.client.get_account_balances() or {}).get("balances")
+            if not isinstance(balances, dict) or balances.get("total_equity") is None:
+                return None
+            return float(balances["total_equity"])
+        except Exception as e:
+            log.warning(f"Equity read failed ({e}) — treating as UNKNOWN")
+            return None
+
+    def _floor_path(self) -> Path:
+        return _state_dir() / "equity_floor_tripped.json"
+
+    def check_equity_floor(self) -> tuple[bool, str]:
+        """(halted, reason). v5.25 account-level floor, CONFIG["equity_floor"].
+
+        The daily loss limit stops a bad DAY; nothing stopped a bad month.
+        Once equity closes below the floor, new entries stop and STAY stopped
+        across restarts and days until the owner deletes
+        equity_floor_tripped.json. Exits keep running — this halts buying,
+        it does not dump open positions.
+        """
+        floor = CONFIG.get("equity_floor")
+        if not floor:
+            return False, "OK"
+        path = self._floor_path()
+        if path.exists():
+            return True, (f"EQUITY FLOOR HALT in force since "
+                          f"{path.read_text().strip()[:80]} — delete {path.name} to resume")
+        equity = self.get_equity_strict()
+        if equity is None:
+            return True, "Equity unreadable — no entries this cycle (floor check)"
+        if equity < float(floor):
+            stamp = json.dumps({"tripped": datetime.now().isoformat(timespec="seconds"),
+                                "equity": round(equity, 2), "floor": float(floor)})
+            path.write_text(stamp)
+            msg = (f"Equity ${equity:.2f} fell below the ${float(floor):.2f} floor. "
+                   f"New entries HALTED until you delete {path.name} "
+                   f"(open positions are still managed).")
+            log.warning(f"🧱 {msg}")
+            alerts.send("OptionsAgent: equity floor tripped", msg,
+                        priority="urgent", tags="no_entry")
+            return True, msg
+        return False, "OK"
+
     def _dynamic_capital_limit(self) -> float:
         """Base capital + 75% of gains above initial capital (raised from 50%)."""
         base = float(CONFIG["capital_limit"])
@@ -1134,6 +1193,8 @@ class RiskManager:
                    f"({daily_loss_pct:.1f}%) from day start. "
                    f"No more trades today. (limit: ${self._dynamic_daily_loss_limit():.2f})")
             log.warning(f"🔴 {msg}")
+            alerts.send("OptionsAgent: daily kill switch fired", msg,
+                        priority="high", tags="red_circle")
             return True, msg
 
         limit = self._dynamic_daily_loss_limit()
@@ -2149,6 +2210,11 @@ class OptionsAgent:
             log.info("🌆 Inside the EOD flatten window — no new entries.")
             return
 
+        halted, why = self.risk.check_equity_floor()
+        if halted:
+            log.warning(f"🧱 {why}")
+            return
+
         capital = self.risk.get_available_capital()
         cap_limit = self.risk._dynamic_capital_limit()
         log.info(f"Available capital: ${capital:.2f} (limit: ${cap_limit:.2f})")
@@ -2592,6 +2658,35 @@ class OptionsAgent:
             )
         log.info(f"📊 ════════════════════════════════════════════════════")
 
+    def _after_close(self):
+        """Once per session, after the close: summary, and the overnight check."""
+        self._write_daily_summary()
+        try:
+            balance = self.risk.get_account_balance()
+            start = self.risk._start_of_day_capital or balance
+            n = len(self.trades_today)
+            alerts.send("OptionsAgent: day summary",
+                        f"Day P&L ${balance - start:+.2f} | equity ${balance:.2f} | "
+                        f"{n} entr{'y' if n == 1 else 'ies'}",
+                        priority="low", tags="bar_chart")
+        except Exception as e:
+            log.warning(f"Day summary alert skipped: {e}")
+        self.trades_today = []
+
+        # Nothing should survive the 15:45 flatten. If something did, it rides
+        # overnight — which the owner has ruled out — so say so loudly.
+        open_n = self.risk.get_open_position_count()
+        if open_n > 0:
+            msg = (f"{open_n} position(s) still open after the close. They will be "
+                   f"held overnight unless closed — check Tradier.")
+            log.warning(f"🌙 {msg}")
+            alerts.send("OptionsAgent: positions open after close", msg,
+                        priority="urgent", tags="crescent_moon")
+        elif open_n < 0:
+            alerts.send("OptionsAgent: could not verify flat after close",
+                        "Position check failed after the close — look at Tradier.",
+                        priority="high", tags="warning")
+
     def _fast_monitor_loop(self):
         """Runs every 30s to check exits only — independent of main scan cycle."""
         import threading
@@ -2704,8 +2799,14 @@ class OptionsAgent:
             log.warning("   ⚠️  LIVE + crash mode armed. Run preflight.py first to "
                         "confirm a structure is actually reachable at your budget.")
 
-        last_summary_date = None
         self._fast_monitor_loop()
+        alerts.send("OptionsAgent started",
+                    f"Equity floor ${float(CONFIG.get('equity_floor') or 0):.0f}, "
+                    f"fade_calls={CONFIG.get('fade_calls', False)}. "
+                    f"Unexpected restarts mean something crashed.",
+                    priority="low", tags="robot")
+        seen_open_on = None      # date the session was last seen "open"
+        closed_out_on = None     # date _after_close() last ran
 
         while True:
             try:
@@ -2715,13 +2816,18 @@ class OptionsAgent:
                 minute  = now.minute
                 weekday = now.weekday()
 
-                if hour == 16 and minute < 5 and last_summary_date != now.date():
-                    self._write_daily_summary()
-                    self.trades_today = []
-                    last_summary_date = now.date()
-
                 # v5.22: the exchange calendar decides, not the wall clock.
                 state = market_state(self.client)
+
+                # v5.25: the session summary used to fire only if the loop
+                # happened to wake between 16:00 and 16:05, and ignored early
+                # closes. It now runs once, on the first pass after a session
+                # that was seen open stops being open.
+                if state == "open":
+                    seen_open_on = now.date()
+                elif seen_open_on == now.date() and closed_out_on != now.date():
+                    self._after_close()
+                    closed_out_on = now.date()
 
                 # The 09:00 catalyst/insider screen is allowed to run premarket.
                 # On a holiday Tradier reports "closed" all day, so it does not.
@@ -2751,6 +2857,8 @@ class OptionsAgent:
                 break
             except Exception as e:
                 log.error(f"Unexpected error in main loop: {e}")
+                alerts.send("OptionsAgent: main loop error", str(e)[:400],
+                            priority="high", tags="warning")
 
             time.sleep(CONFIG["scan_interval_seconds"])
 
