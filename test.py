@@ -1233,6 +1233,25 @@ def test_end_to_end():
           len([o for o in b5.orders if isinstance(o, dict)]) == 1,
           f"orders={b5.orders}")
 
+    # ── v5.24 CALL fade, end to end: a CALL signal must leave as a PUT order ──
+    # FakeBroker's chain holds puts only, so an unfaded CALL cannot fill.
+    call_sig = {**sig, "direction": "CALL"}
+    orig_fade = CONFIG.get("fade_calls")
+    CONFIG["fade_calls"] = True
+    b6 = FakeBroker()
+    a6 = _cycle((bull, ov_bull, [call_sig]), b6)
+    o6 = [o for o in b6.orders if isinstance(o, dict)]
+    check("fade on: a CALL signal places a PUT order",
+          len(o6) == 1 and "P" in o6[0]["option_symbol"][-9:-8], f"orders={o6}")
+    check("fade on: the order is marked faded for fade_study.py",
+          bool(a6.trades_today) and a6.trades_today[0].get("faded") is True)
+    CONFIG["fade_calls"] = False
+    b7 = FakeBroker()
+    _cycle((bull, ov_bull, [call_sig]), b7)
+    check("fade off: the same CALL signal places no PUT",
+          not [o for o in b7.orders if isinstance(o, dict)], f"orders={b7.orders}")
+    CONFIG["fade_calls"] = orig_fade
+
     # ── sizing must not compound VIX x regime multipliers into nothing ──
     b5 = FakeBroker()
     CONFIG["max_trade_size"] = 125.0

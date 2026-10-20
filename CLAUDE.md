@@ -276,3 +276,20 @@ Run both after any change to the gates, exits or friction settings.
 Account-size constraint, not a bug: on ~$609 equity the 15% cap is ~$91, so
 contracts above ~$0.91 cannot be bought. Realised, contracts under $1 lost in
 both periods. Raising max_position_pct is a risk decision for the owner.
+
+## v5.24 — 2026-10-20: CALL fade, LIVE experiment (owner's decision)
+
+`fade_calls: True` (config.py) trades every CALL signal as a PUT
+(`OptionsAgent._fade_calls`). PUT signals are unchanged; if PUTs are blocked
+that cycle, faded CALLs are dropped, never bought as CALLs. TradeJudge gets a
+leading "CONTRARIAN FADE" reason line so bullish technicals don't read as a
+contradiction. Faded orders carry `"faded": true` in trades.json.
+
+Evidence going in (shadow, 60m): CALL signals wrong 53.6% (n=4192). For
+tradeable scores >= 14.7 (n=214) the fade hits 58.4%, BUT the mean move is
+-0.14% ±0.23 AGAINST it: when those CALLs are right they are right by a lot.
+The bet is that the 25% stop caps that tail on the long PUT. Not proven.
+
+Judge it with `./venv/bin/python fade_study.py` (realised P&L, FADE vs PUT
+vs CALL). Verdict after 30+ fade trades; stop at once if net is negative.
+Off switch: `fade_calls: False`, then restart after the close.

@@ -396,6 +396,25 @@ try:
     _v523("resolved shadow records keep regime_bonus",
           'out["regime_bonus"]' in inspect.getsource(_sh))
 
+    # ── v5.24: CALL fade ──────────────────────────────────────────────────
+    a = ag.OptionsAgent.__new__(ag.OptionsAgent)
+    sigs = [{"ticker": "AAA", "direction": "CALL", "score": 16.0, "reasons": ["rsi up"]},
+            {"ticker": "BBB", "direction": "PUT", "score": 15.0, "reasons": ["rsi dn"]}]
+    out = a._fade_calls(sigs, {"allow_puts": True})
+    _v523("fade: a CALL signal becomes a faded PUT",
+          out[0]["direction"] == "PUT" and out[0].get("faded") is True)
+    _v523("fade: TradeJudge is told the trade is contrarian",
+          out[0]["reasons"][0].startswith("🔄 CONTRARIAN FADE")
+          and out[0]["reasons"][1] == "rsi up")
+    _v523("fade: genuine PUT signals pass through unchanged",
+          out[1] is sigs[1] and not out[1].get("faded"))
+    _v523("fade: original signal dict is not mutated", sigs[0]["direction"] == "CALL")
+    out = a._fade_calls(sigs, {"allow_puts": False})
+    _v523("fade: with PUTs blocked a CALL is dropped, never bought as a CALL",
+          [s["ticker"] for s in out] == ["BBB"])
+    _v523("fade: run_once applies it behind the fade_calls switch",
+          'CONFIG.get("fade_calls", False)' in run_src)
+
     # ── 5b. No new entries inside the flatten window ──────────────────────
     _v523("run_once stops entering once the flatten window opens",
           "self.monitor._past_flatten_time()" in run_src)

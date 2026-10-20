@@ -2019,6 +2019,44 @@ class OptionsAgent:
             log.error(f"Pre-market scan error: {e}")
             self.premarket_watchlist = []
 
+    def _fade_calls(self, signals: list, overrides: dict) -> list:
+        """v5.24 experiment (fade_calls): trade every CALL signal as a PUT.
+
+        Shadow record, 60m forward: CALL signals were wrong 53.6% of the time
+        (n=4192), so the 3/3 RSI+MACD+volume confluence reads as a momentum-
+        EXHAUSTION detector. For tradeable scores (>= 14.7, n=214) the fade
+        wins 58.4% of the time, BUT the mean move runs -0.14% (±0.23) against
+        it: when those CALLs are right they are right by a lot. The 25% stop
+        caps that tail on a long PUT, which is the bet. Unproven — judge it
+        with fade_study.py, and set fade_calls False to stop.
+
+        PUT signals pass through unchanged. If PUTs are blocked this cycle
+        (recovery state, bull_allow_puts False) faded CALLs are dropped, never
+        bought as CALLs: in fade mode the agent does not buy calls.
+        """
+        allow_puts = overrides.get("allow_puts", True)
+        out = []
+        for s in signals:
+            if s["direction"] != "CALL":
+                out.append(s)
+                continue
+            if not allow_puts:
+                log.info(f"  ⬜ {s['ticker']}: CALL signal not faded — PUTs blocked this cycle")
+                continue
+            log.info(f"  🔄 FADE {s['ticker']}: CALL signal (score {s['score']}) → PUT")
+            out.append({
+                **s,
+                "direction": "PUT",
+                "faded": True,
+                "reasons": ["🔄 CONTRARIAN FADE: the technicals below are BULLISH by "
+                            "design. This system's bullish signals were wrong 54-58% of "
+                            "the time over the next hour (momentum exhaustion), so this "
+                            "trade deliberately takes the PUT. Judge the PUT on news, "
+                            "sector and history; do not skip it merely because the "
+                            "technicals point up."] + list(s.get("reasons", [])),
+            })
+        return out
+
     def _should_reenter(self, ticker: str, signal: dict) -> bool:
         """
         After cooldown expires, decide if we should re-enter a ticker.
@@ -2146,6 +2184,9 @@ class OptionsAgent:
             log.info(f"⚠️  VIX={vix:.1f} > {max_vix} — skipping scan, market too chaotic")
             return
 
+        if CONFIG.get("fade_calls", False):
+            top_signals = self._fade_calls(top_signals, overrides)
+
         if not top_signals:
             log.info("No high-confidence signals found this cycle.")
             return
@@ -2226,6 +2267,8 @@ class OptionsAgent:
                                                   max_cost=_order_cap)
 
             if t:
+                if sig.get("faded"):
+                    t["faded"] = True      # lands in trades.json for fade_study.py
                 # Backstop for the bounded search. Top-level "ask" is the
                 # per-contract cost for every structure (the debit for a
                 # vertical). Too big → next signal, not end of cycle.
