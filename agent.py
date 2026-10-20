@@ -2320,7 +2320,7 @@ class OptionsAgent:
             # never actually incurred. _unit is already the right number —
             # debit for a spread, ask otherwise — so use it.
             #
-            # This is a candidate answer to the open question in Claude.md:
+            # This is a candidate answer to the open question in CLAUDE.md:
             # "has the vertical_debit / deep_itm path ever placed a live
             # order?" On a $609 account the 15% cap binds on nearly every
             # order, so this branch ran nearly every time a spread was tried.
