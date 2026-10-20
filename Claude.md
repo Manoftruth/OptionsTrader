@@ -12,7 +12,8 @@ screens via yfinance around 09:00 ET.
   direction, structure, option_symbol, strike, expiry, ask, bid, delta, contracts,
   total_cost, score, time. Spread records add a `spread` object, deep-ITM records add
   a `deep_itm` object and `source_signal_ticker`.
-- `trades.json.bak`: pre-cleanup copy. Contains the 74 test-pollution records described below.
+- `trades.json.bak`: DELETED 2026-10-20 at the owner's request. It was the pre-cleanup copy holding
+  the 74 test-pollution records described below; the cleanup itself is documented there.
 - `risk_state.json`: daily loss and kill-switch state.
 - `report.py`: `./venv/bin/python report.py --since YYYY-MM-DD`
 - `test.py`, `test_newfeatures.py`: run `run_once` against a fake broker and a mock Tradier.
