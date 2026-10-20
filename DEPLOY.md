@@ -73,6 +73,24 @@ journalctl -u optionstrader -f         # follow
 sudo systemctl stop optionstrader      # stop
 ```
 
+**The current production box is different.** It runs a hand-written unit,
+`/etc/systemd/system/options-agent.service`, not the `optionstrader` unit the
+setup script installs. On that box:
+
+```bash
+sudo systemctl restart options-agent   # pick up code or config.py edits
+systemctl status options-agent         # is it running, which PID
+tail -f ~/OptionsTrader/agent.log      # follow (it logs to the file, not journald)
+sudo systemctl stop options-agent      # stop
+```
+
+Check `systemctl list-units | grep -i agent` before assuming either name, and
+never have both units enabled: two agents on one account is the failure
+described under "Two agents, one account" below.
+
+The agent only reads code and `config.py` at startup, so edits do nothing until
+a restart. Restart after the 16:00 close, not during the session.
+
 ---
 
 ## Things that bite on EC2 specifically
@@ -110,6 +128,8 @@ The async scan holds 8 concurrent connections. Do not raise
 `scan_concurrency` above ~12; Yahoo rate limits, and then you have no data,
 which is worse than being slow.
 
-**Market holidays.** The loop skips weekends but not NYSE holidays. On a
-holiday it scans, finds nothing tradeable, and burns API calls. Harmless, just
-noisy.
+**Market holidays and early closes.** Since v5.22 the loop asks Tradier's
+market clock (`/markets/clock`) and only trades while it reports `open`, so
+holidays are skipped. Since v5.23 the end-of-day flatten follows the real close
+too (12:45 on a 13:00 early-close day). If the clock call fails the agent falls
+back to wall-clock hours, which do not know about holidays.
