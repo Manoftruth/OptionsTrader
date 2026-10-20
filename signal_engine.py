@@ -51,6 +51,44 @@ from congress_tracker import CongressTracker
 
 log = logging.getLogger("OptionsAgent")
 
+# ── Per-day dead-ticker cache ──────────────────────────────────────────────
+# A delisted ticker does not come back to life during a session, but the scan
+# loop re-asks Yahoo about it every ~200s and each miss costs two attempts plus
+# a 1.5s sleep. CFLT and EXAS alone accounted for 15 of the 42 yfinance errors
+# in one morning screen.
+#
+# yfinance 1.2.0 has no raise_errors flag and returns an empty frame rather
+# than raising, so "delisted" has to be inferred. Requiring three consecutive
+# all-empty fetches keeps a transient Yahoo hiccup from benching a live ticker
+# for the day, and any successful fetch clears the count.
+_DEAD_TICKERS: dict = {}    # ticker -> date it was written off
+_EMPTY_STREAK: dict = {}    # ticker -> (date, consecutive empty fetches)
+_DEAD_AFTER_EMPTY = 3
+_DELISTED_MARKERS = ("possibly delisted", "no data found", "not found", "404")
+
+
+def _is_dead_today(ticker: str) -> bool:
+    return _DEAD_TICKERS.get(ticker) == datetime.now().date()
+
+
+def _mark_dead(ticker: str, why: str) -> None:
+    if not _is_dead_today(ticker):
+        _DEAD_TICKERS[ticker] = datetime.now().date()
+        log.info(f"\U0001faa6 {ticker} written off for today ({why}) — no further Yahoo calls")
+
+
+def _note_empty(ticker: str) -> None:
+    today = datetime.now().date()
+    day, n = _EMPTY_STREAK.get(ticker, (today, 0))
+    n = n + 1 if day == today else 1
+    _EMPTY_STREAK[ticker] = (today, n)
+    if n >= _DEAD_AFTER_EMPTY:
+        _mark_dead(ticker, f"{n} consecutive empty fetches")
+
+
+def _note_ok(ticker: str) -> None:
+    _EMPTY_STREAK.pop(ticker, None)
+
 # FIX 3: Removed dead/delisted tickers — CFLT, EXAS, SQ, PARA, NKLA were generating
 # constant "possibly delisted" noise. These are no longer valid 0DTE targets.
 FULL_WATCHLIST    = ["SPY", "QQQ", "TSLA", "NVDA", "AMD", "META", "AMZN", "MSFT", "AAPL"]
@@ -80,6 +118,9 @@ class SignalEngine:
         Yahoo Finance rotates crumbs and occasionally returns 401 Unauthorized.
         A single retry after a short sleep resolves the vast majority of these.
         """
+        if _is_dead_today(ticker):
+            return pd.DataFrame()
+
         max_attempts = 2
         for attempt in range(max_attempts):
             try:
@@ -95,6 +136,10 @@ class SignalEngine:
                     log.debug(f"Empty result for {ticker} {interval}, retrying...")
                     time.sleep(1.5)
                     continue
+                if result.empty:
+                    _note_empty(ticker)
+                else:
+                    _note_ok(ticker)
                 return result
             except Exception as e:
                 err_str = str(e)
@@ -103,7 +148,10 @@ class SignalEngine:
                         log.debug(f"yfinance 401/crumb error for {ticker}, retrying in 2s...")
                         time.sleep(2.0)
                         continue
-                log.warning(f"Data fetch error {ticker} {interval}: {e}")
+                if any(mark in err_str.lower() for mark in _DELISTED_MARKERS):
+                    _mark_dead(ticker, "Yahoo reports it delisted")
+                else:
+                    log.warning(f"Data fetch error {ticker} {interval}: {e}")
                 return pd.DataFrame()
         return pd.DataFrame()
 
@@ -662,10 +710,18 @@ class SignalEngine:
                 bonus_score  += uvol_bonus
                 bonus_reasons.extend(uvol.get("reasons", []))
 
-            regime_score = 0
-            if (regime == "bull" and final_direction == "CALL") or \
-               (regime == "bear" and final_direction == "PUT"):
-                regime_score = 2
+            # v5.23 — the bonus size is config (regime_align_bonus, default 2,
+            # unchanged). It rewards agreement with a DAILY trend reading,
+            # which v5.22 found carries no information about the next hour,
+            # and in a bull tape it tilts the threshold toward CALLs, the
+            # side with the negative measured edge. Bull PUTs were never
+            # scored before v5.22, so it cannot be judged yet: every scored
+            # signal now records its bonus in the shadow log, and
+            # regime_bonus_study.py compares bonus=2 against bonus=0.
+            regime_aligned = (regime == "bull" and final_direction == "CALL") or \
+                             (regime == "bear" and final_direction == "PUT")
+            regime_score = float(ov.get("regime_align_bonus", 2.0)) if regime_aligned else 0.0
+            if regime_aligned:
                 bonus_reasons.insert(0, f"✅ Regime ({regime.upper()}) aligned with {final_direction}")
             bonus_score += regime_score
 
@@ -711,7 +767,8 @@ class SignalEngine:
                 "score":            total_score,
                 "price":            price_1h,
                 "confluence":       confluence_score,
-                "regime_aligned":   regime_score == 2,
+                "regime_aligned":   regime_aligned,
+                "regime_bonus":     regime_score,
                 "trend_bonus":      trend_bonus,
                 "vol_pct":          round(vol_pct, 2),
                 "has_squeeze":      has_squeeze,
@@ -738,12 +795,22 @@ class SignalEngine:
 
     # ── Top signals ────────────────────────────────────────────────────────────
     def get_top_signals(self, min_score: int = 14,
-                        watchlist: list | None = None) -> list:
+                        watchlist: list | None = None,
+                        overrides: dict | None = None) -> list:
         # v5.14: the sync fallback had no watchlist parameter at all, so even
         # once the async path honoured CONFIG["watchlist"], a fallback cycle
         # would silently revert to the hardcoded megacap list. Two scanners
         # disagreeing about what to scan is worse than either choice.
         _wl_override = list(watchlist) if watchlist else None
+
+        # Overrides reach this path too now. The caller (agent._regime_and_
+        # signals_sync) was already computing them via crash_mode.overrides_for
+        # and then discarding them at the call site; score_core defaults both
+        # gates to True when it gets nothing, which is how calls stayed legal
+        # in a crash on the fallback path.
+        _ov = overrides or {}
+        _allow_calls = bool(_ov.get("allow_calls", True))
+        _allow_puts = bool(_ov.get("allow_puts", True))
         regime = self._market_regime()
         self.last_regime = regime
         log.info(f"📊 Market regime: {regime.upper()}")
@@ -769,15 +836,28 @@ class SignalEngine:
 
         signals = []
         for ticker in watchlist:
-            sig = self.score_ticker(ticker, regime, vix)
+            sig = self.score_ticker(ticker, regime, vix, overrides=_ov)
             if sig is None:
                 continue
 
-            if regime == "bear" and sig["direction"] == "CALL":
-                log.info(f"  ⬜ {ticker}: BEAR regime — blocking CALL")
+            # v5.22 — direction gating now comes from the overrides, the same
+            # source the async path uses. It used to be hardcoded here as
+            # "bear blocks CALL, bull blocks PUT", which had two defects:
+            #
+            #   1. It ignored the overrides entirely, so crash_mode's
+            #      puts-only rule never reached this path. "crash" matches
+            #      neither branch, so a sync-fallback cycle during a selloff
+            #      allowed CALLS — the exact position crash mode exists to
+            #      prevent, reachable precisely when the data layer is
+            #      degraded, which is when markets are stressed.
+            #   2. It re-imposed the bull PUT block even when the override
+            #      said puts were allowed, so it would have silently defeated
+            #      the bull_allow_puts setting.
+            if sig["direction"] == "CALL" and not _allow_calls:
+                log.info(f"  ⬜ {ticker}: CALLs blocked by {regime.upper()} regime")
                 continue
-            if regime == "bull" and sig["direction"] == "PUT":
-                log.info(f"  ⬜ {ticker}: BULL regime — blocking PUT")
+            if sig["direction"] == "PUT" and not _allow_puts:
+                log.info(f"  ⬜ {ticker}: PUTs blocked by {regime.upper()} regime")
                 continue
 
             if sig["score"] < threshold:
@@ -873,6 +953,7 @@ class SignalEngine:
                     trace.append({"ticker": ticker, "stage": "below_threshold",
                                   "direction": sig["direction"],
                                   "score": sig["score"], "spot": sig["price"],
+                                  "regime_bonus": sig.get("regime_bonus"),
                                   "accepted": False})
                 continue
 
@@ -880,6 +961,7 @@ class SignalEngine:
                 trace.append({"ticker": ticker, "stage": "accepted",
                               "direction": sig["direction"],
                               "score": sig["score"], "spot": sig["price"],
+                              "regime_bonus": sig.get("regime_bonus"),
                               "accepted": True})
 
             signals.append(sig)

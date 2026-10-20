@@ -7,6 +7,11 @@ Run from ~/OptionsTrader:
     python3 test_new_features.py
 """
 
+# ── Test isolation: MUST precede every project import (hard rule 1). ────────
+# chdir()s into a temp dir, redirects OPTIONSTRADER_STATE_DIR, and aborts at
+# exit if any production state file changed. See _sandbox.py.
+import _sandbox  # noqa: F401
+
 import json
 import logging
 import sys
@@ -73,6 +78,7 @@ print("🔄 TEST 2: Re-entry logic")
 print("-" * 40)
 try:
     from agent import OptionsAgent
+    from config import CONFIG
 
     with patch("agent.TradierClient"), \
          patch("agent.SignalEngine"), \
@@ -83,20 +89,28 @@ try:
 
         agent = OptionsAgent()
 
+        # Derive the fixtures from config, not magic numbers: _should_reenter
+        # gates on CONFIG["min_signal_score"] + 1.0, and that config value has
+        # been retuned before (15.9 -> 14.1), which silently turned a "weak"
+        # fixture into a passing one.
+        REENTRY_BAR = CONFIG["min_signal_score"] + 1.0
+        STRONG = round(REENTRY_BAR + 2.0, 2)   # comfortably over the bar
+        WEAK   = round(REENTRY_BAR - 0.5, 2)   # just under the bar
+
         # Strong signal — should allow re-entry
-        strong_signal = {"score": 18.5, "confluence": 4}
+        strong_signal = {"score": STRONG, "confluence": 4}
         result = agent._should_reenter("AMZN", strong_signal)
         assert result == True, "Strong signal should allow re-entry"
-        print(f"  ✅ Strong signal (score=18.5, confluence=4): re-entry APPROVED")
+        print(f"  ✅ Strong signal (score={STRONG}, confluence=4): re-entry APPROVED")
 
         # Weak score — should block re-entry
-        weak_signal = {"score": 15.5, "confluence": 4}
+        weak_signal = {"score": WEAK, "confluence": 4}
         result = agent._should_reenter("AMZN", weak_signal)
         assert result == False, "Weak score should block re-entry"
-        print(f"  ✅ Weak signal (score=15.5): re-entry BLOCKED")
+        print(f"  ✅ Weak signal (score={WEAK} < bar {REENTRY_BAR}): re-entry BLOCKED")
 
         # Low confluence — should block re-entry
-        low_confluence = {"score": 18.5, "confluence": 2}
+        low_confluence = {"score": STRONG, "confluence": 2}
         result = agent._should_reenter("AMZN", low_confluence)
         assert result == False, "Low confluence should block re-entry"
         print(f"  ✅ Low confluence (2/4): re-entry BLOCKED")
@@ -113,7 +127,7 @@ try:
         with open(results_file, "w") as f:
             f.write(json.dumps(test_record) + "\n")
 
-        strong_signal_pltr = {"score": 18.5, "confluence": 4}
+        strong_signal_pltr = {"score": STRONG, "confluence": 4}
         result = agent._should_reenter("PLTR", strong_signal_pltr)
         assert result == False, "Should block re-entry after big loss"
         print(f"  ✅ After -35% loss on PLTR: re-entry BLOCKED")
@@ -145,3 +159,252 @@ except Exception as e:
 print("=" * 60)
 print("  ALL TESTS COMPLETE")
 print("=" * 60)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  v5.22 regression tests — risk checks must fail CLOSED, config must be live
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 60)
+print("  TEST 3: v5.22 — fail-closed risk checks and live config keys")
+print("=" * 60)
+
+_v522_fails = []
+
+
+def _v522(label, cond, detail=""):
+    if cond:
+        print(f"  ✅ {label}" + (f"  — {detail}" if detail else ""))
+    else:
+        print(f"  ❌ {label}" + (f"  — {detail}" if detail else ""))
+        _v522_fails.append(label)
+
+
+try:
+    import agent as ag
+    import crash_mode as cm
+    from config import CONFIG
+
+    # ── 1. Risk checks must fail CLOSED, not open ─────────────────────────
+    # Before v5.22 both of these swallowed every exception and reported
+    # "nothing is open", so a transient Tradier error let the agent stack
+    # positions past its ceiling and double up on a ticker it already held.
+    class _BrokenClient:
+        def get_positions(self):
+            raise RuntimeError("simulated Tradier outage")
+
+    class _FlatClient:
+        def get_positions(self):
+            return {"positions": "null"}      # Tradier's genuine "flat"
+
+    class _JunkClient:
+        def get_positions(self):
+            return ["unexpected", "shape"]
+
+    rm = ag.RiskManager.__new__(ag.RiskManager)
+
+    rm.client = _BrokenClient()
+    _v522("broken broker → position count is UNKNOWN (-1), not 0",
+          rm.get_open_position_count() == -1)
+    _v522("broken broker → open tickers is None, not an empty set",
+          rm.get_open_tickers() is None)
+
+    rm.client = _JunkClient()
+    _v522("malformed payload → UNKNOWN, not 0",
+          rm.get_open_position_count() == -1)
+
+    rm.client = _FlatClient()
+    _v522("a genuinely flat account still reports 0, not UNKNOWN",
+          rm.get_open_position_count() == 0,
+          "Tradier sends the string 'null' when flat")
+    _v522("a genuinely flat account reports an empty ticker set",
+          rm.get_open_tickers() == set())
+
+    # ── 2. Config keys that used to be dead must now be read ──────────────
+    # The sandbox chdir()s into a temp dir, so resolve from the module
+    # file rather than the working directory.
+    src_agent = open(ag.__file__).read()
+    for key in ("max_concurrent_positions", "daily_loss_limit",
+                "take_profit_pct", "stop_loss_pct"):
+        _v522(f"config key '{key}' is actually read by agent.py",
+              f'"{key}"' in src_agent)
+
+    _v522("the tighter of dollar and percent daily loss limit wins",
+          'min(pct_limit' in src_agent)
+
+    # ── 3. The bull PUT block is gone by default, and still switchable ────
+    bull = cm.overrides_for(cm.RegimeReport(regime="bull", vix=14.0), {})
+    _v522("bull regime allows PUTs by default", bull["allow_puts"] is True)
+    off = cm.overrides_for(cm.RegimeReport(regime="bull", vix=14.0),
+                           {"bull_allow_puts": False})
+    _v522("bull_allow_puts=False still restores the block",
+          off["allow_puts"] is False)
+
+    # ── 4. The sync fallback must honour crash overrides ──────────────────
+    # It used to hardcode "bear blocks CALL, bull blocks PUT", which matched
+    # neither branch for regime=="crash" — so a degraded-data cycle during a
+    # selloff permitted CALLS, the exact trade crash mode exists to forbid.
+    import inspect
+    import signal_engine as se
+    sig = inspect.signature(se.SignalEngine.get_top_signals)
+    _v522("sync get_top_signals accepts overrides", "overrides" in sig.parameters)
+    sync_src = inspect.getsource(ag.OptionsAgent._regime_and_signals)
+    _v522("sync call site passes overrides instead of discarding them",
+          "overrides=ov" in sync_src)
+    gts = inspect.getsource(se.SignalEngine.get_top_signals)
+    _v522("sync direction gate is override-driven, not hardcoded by regime",
+          "_allow_calls" in gts and "_allow_puts" in gts)
+    _v522("the old hardcoded bull PUT block is gone",
+          'regime == "bull" and sig["direction"] == "PUT"' not in gts)
+
+    # ── 5. The entry pad must not give away edge ──────────────────────────
+    _v522("entry_limit_pad_pct is 0 — no paying above the ask",
+          float(CONFIG.get("entry_limit_pad_pct", 3.0)) == 0.0,
+          f"is {CONFIG.get('entry_limit_pad_pct')}")
+
+    # ── 6. Spread recap must cost the debit, not the long leg's ask ───────
+    _v522("capped spread cost uses the per-unit debit",
+          'trade["total_cost"] = _capped * _unit * 100' in src_agent)
+
+    if _v522_fails:
+        print(f"\n  ❌ TEST 3 FAILED: {len(_v522_fails)} check(s): {_v522_fails}")
+    else:
+        print("\n  ✅ TEST 3 PASSED\n")
+
+except Exception as e:
+    print(f"  ❌ TEST 3 FAILED: {e}")
+    import traceback; traceback.print_exc()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  v5.23 regression tests — bull PUTs, cap-bounded search, fills, EOD
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 60)
+print("  TEST 4: v5.23 — bull PUTs reach execution, cap bounds the search")
+print("=" * 60)
+
+_v523_fails = []
+
+
+def _v523(label, cond, detail=""):
+    if cond:
+        print(f"  ✅ {label}" + (f"  — {detail}" if detail else ""))
+    else:
+        print(f"  ❌ {label}" + (f"  — {detail}" if detail else ""))
+        _v523_fails.append(label)
+
+
+try:
+    import inspect
+    import agent as ag
+    import crash_mode as cm
+    from config import CONFIG
+
+    # ── 1. can_trade() must not re-block bull PUTs off the raw regime ─────
+    rm = ag.RiskManager.__new__(ag.RiskManager)
+    rm.check_daily_loss_limit = lambda c: (False, "OK")
+    rm.get_open_position_count = lambda: 0
+    rm._dynamic_max_positions = lambda: 2
+    rm._dynamic_capital_limit = lambda: 1000.0
+    rm._get_vix_cached = lambda: 15.0
+    rm._get_spy_cached = lambda: 0.2
+    put = {"total_cost": 50.0, "signal": {"direction": "PUT", "score": 16}}
+    bull_ov = cm.overrides_for(cm.RegimeReport(regime="bull", vix=15.0), {})
+    ok, why = rm.can_trade(put, 500.0, "bull", bull_ov)
+    _v523("bull-regime PUT passes can_trade when overrides allow it", ok, why)
+    off_ov = cm.overrides_for(cm.RegimeReport(regime="bull", vix=15.0),
+                              {"bull_allow_puts": False})
+    ok, why = rm.can_trade(put, 500.0, "bull", off_ov)
+    _v523("bull_allow_puts=False still blocks it, via the overrides", not ok, why)
+
+    # ── 2. The equity cap bounds contract SEARCH, not just the result ─────
+    class _ChainClient:
+        def get_options_chain(self, ticker, expiry):
+            return {"options": {"option": [
+                {"symbol": "T45", "option_type": "put", "strike": 100.0,
+                 "ask": 2.50, "bid": 2.45, "greeks": {"delta": -0.45}},
+                {"symbol": "T30", "option_type": "put", "strike": 97.0,
+                 "ask": 0.80, "bid": 0.78, "greeks": {"delta": -0.30}},
+            ]}}
+
+    sel = ag.OptionsSelector.__new__(ag.OptionsSelector)
+    sel.client = _ChainClient()
+    sel.get_nearest_expiry = lambda t, days_out=0: "2026-10-21"
+    sig = {"ticker": "TST", "direction": "PUT", "price": 100.0, "score": 20.0,
+           "confluence": 4, "vix_size_mult": 1.0}
+    _orig_td = CONFIG.get("contract_target_delta")
+    CONFIG["contract_target_delta"] = 0.45      # pin: independent of config.py
+    uncapped = sel.select_contract(sig, 500.0, {"max_contract_price": 3.0})
+    capped = sel.select_contract(sig, 500.0, {"max_contract_price": 3.0},
+                                 max_cost=91.0)
+    CONFIG["contract_target_delta"] = _orig_td
+    _v523("without the cap the selector reaches the $2.50 0.45-delta contract",
+          uncapped and uncapped["option_symbol"] == "T45")
+    _v523("with a $91 cap it picks what the cap can actually buy",
+          capped and capped["option_symbol"] == "T30"
+          and capped["total_cost"] <= 91.0,
+          f"{capped and capped['option_symbol']} ${capped and capped['total_cost']}")
+
+    run_src = inspect.getsource(ag.OptionsAgent.run_once)
+    _v523("every selector call in run_once is cap-bounded",
+          run_src.count("max_cost=_order_cap") == 4)
+    _v523("an over-cap candidate moves to the next signal",
+          "trying next signal" in run_src.split("can_trade(t,")[0].split("max_cost=_order_cap")[-1])
+
+    # ── 3. sl_hint no longer overrides stop_loss_pct by default ───────────
+    _v523("use_sl_hint defaults off", not CONFIG.get("use_sl_hint", False))
+    _v523("sl_hint is gated on use_sl_hint",
+          'CONFIG.get("use_sl_hint", False)' in run_src)
+
+    # ── 4. Partial fills cancel the remainder ─────────────────────────────
+    class _FillClient:
+        def __init__(self, statuses):
+            self.statuses = list(statuses)
+            self.cancels = []
+
+        def get_order(self, oid):
+            s, q = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+            return {"status": s, "exec_quantity": q, "quantity": 3}
+
+        def cancel_order(self, oid):
+            self.cancels.append(oid)
+
+    a = ag.OptionsAgent.__new__(ag.OptionsAgent)
+    a.client = _FillClient([("partially_filled", 1)])
+    filled, why = a._await_fill("42", timeout=5)
+    _v523("partial fill counts as filled", filled, why)
+    _v523("partial fill cancels the unfilled remainder", a.client.cancels == ["42"])
+
+    a.client = _FillClient([("canceled", 1)])
+    filled, why = a._await_fill("43", timeout=5)
+    _v523("partly filled then canceled is still a position we own", filled, why)
+
+    a.client = _FillClient([("open", 0), ("filled", 1)])
+    filled, why = a._await_fill("44", timeout=0.5)
+    _v523("a fill that lands between the last poll and the cancel is kept",
+          filled and a.client.cancels == ["44"], why)
+
+    # ── 6. The fast exit monitor is gated on market hours ─────────────────
+    fm_src = inspect.getsource(ag.OptionsAgent._fast_monitor_loop)
+    _v523("fast monitor only acts while the market is open",
+          'market_state(self.client) != "open"' in fm_src)
+
+    # ── 7. regime_align_bonus is config, and the shadow log keeps it ──────
+    _v523("overrides carry regime_align_bonus from config",
+          cm.overrides_for(cm.RegimeReport(regime="bull", vix=15.0),
+                           {"regime_align_bonus": 0.0})["regime_align_bonus"] == 0.0)
+    import shadow as _sh
+    _v523("resolved shadow records keep regime_bonus",
+          'out["regime_bonus"]' in inspect.getsource(_sh))
+
+    # ── 5b. No new entries inside the flatten window ──────────────────────
+    _v523("run_once stops entering once the flatten window opens",
+          "self.monitor._past_flatten_time()" in run_src)
+
+    if _v523_fails:
+        print(f"\n  ❌ TEST 4 FAILED: {len(_v523_fails)} check(s): {_v523_fails}")
+    else:
+        print("\n  ✅ TEST 4 PASSED\n")
+
+except Exception as e:
+    print(f"  ❌ TEST 4 FAILED: {e}")
+    import traceback; traceback.print_exc()

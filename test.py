@@ -8,24 +8,18 @@ spreads, async_data or the PositionMonitor changes.
 
     python3 test_v5.py
 """
-import os as _os
-import tempfile as _tempfile
+# ── Test isolation: MUST precede every project import (hard rule 1). ────────
+# chdir()s into a temp dir, redirects OPTIONSTRADER_STATE_DIR, and aborts at
+# exit if any production state file changed. See _sandbox.py.
+import _sandbox  # noqa: F401
 
-# ── v5.21: isolate runtime state BEFORE importing anything ──────────────────
-#
-# The suite runs in the same directory as the live agent. Once v5.17 made the
-# daily risk baseline persistent, RiskManager.__init__ began loading the
-# PRODUCTION risk_state.json — so the fake broker's $500 balance was measured
-# against the real account's $798.30 morning baseline, the kill switch fired
-# at a phantom -37%, and eight order-placing checks failed with no visible
-# cause. The tests were reporting on the live account, not on the code.
-#
-# Worse than the false failures: the suite could also WRITE those files, so a
-# test run would have edited the live agent's risk and regime memory.
-#
-# This must run before `import agent`, because the path is resolved when the
-# RiskManager is constructed.
-_os.environ["OPTIONSTRADER_STATE_DIR"] = _tempfile.mkdtemp(prefix="ot-test-state-")
+import os as _os
+
+# v5.21's inline state-dir redirect lived here. _sandbox (imported above) now
+# owns OPTIONSTRADER_STATE_DIR and points it at the same directory it chdir()s
+# into; setting it again here re-pointed state at a SECOND temp dir, so state
+# writes and cwd-relative writes landed in different places and the fixture
+# copy of config.py was not where the state files were.
 
 import asyncio
 import json
@@ -197,8 +191,24 @@ def test_overrides():
           ov_on["min_signal_score"] > 15.9, f"{ov_on['min_signal_score']}")
     check("crash + armed → premium cap raised", ov_on["max_contract_price"] > 3.0)
 
+    # v5.22 — the bull regime no longer blocks PUTs by default.
+    #
+    # This assertion used to read `allow_puts is False`. That encoded a policy
+    # which measurement showed was backwards: _market_regime() is a DAILY
+    # trend (SPY > EMA20 > EMA50) and read "bull" for 93.5% of 8,115 recorded
+    # signals, so it was vetoing intraday 30-60 minute PUT signals on a
+    # timescale it says nothing about. Measured forward returns:
+    #   CALL n=4192 60m hit 46.3% mean -0.0805%
+    #   PUT  n=3898 60m hit 51.8% mean +0.0952%  (z=+4.94, p<0.00001)
+    # PUTs were the only side with a positive edge, and 28 of the last 29 live
+    # orders were CALLs. See edge_study.py.
     bull = cm.overrides_for(cm.RegimeReport(regime="bull", vix=14.0), {})
-    check("bull → puts blocked", bull["allow_puts"] is False and bull["allow_calls"] is True)
+    check("bull → calls allowed", bull["allow_calls"] is True)
+    check("bull → puts allowed by default (v5.22)", bull["allow_puts"] is True)
+    bull_off = cm.overrides_for(cm.RegimeReport(regime="bull", vix=14.0),
+                                {"bull_allow_puts": False})
+    check("bull_allow_puts=False restores the calls-only block",
+          bull_off["allow_puts"] is False and bull_off["allow_calls"] is True)
 
     degraded = cm.overrides_for(cm.RegimeReport(regime="bull", vix=14.0, degraded=True), {})
     check("degraded data → size halved", degraded["size_mult"] <= 0.5)
@@ -868,8 +878,15 @@ def test_exit_leaks():
           not [o for o in m.client.orders if isinstance(o, dict)])
 
     # ── EOD flatten ──
+    import pytz as _pytz
+    _et = _pytz.timezone("America/New_York")
+
+    def at(hh, mm):    # a Wednesday, so the weekend guard never interferes
+        return lambda: _et.localize(datetime(2026, 10, 21, hh, mm))
+
     orig_flat, orig_time = CONFIG.get("flatten_eod"), CONFIG.get("close_all_by_et")
     m = monitor(bid=0.80)
+    m.now_et = at(12, 0)
     CONFIG["flatten_eod"] = True
     CONFIG["close_all_by_et"] = "00:01"      # everything is "past" this
     check("flatten window detected", m._past_flatten_time() is True)
@@ -878,9 +895,27 @@ def test_exit_leaks():
           len([o for o in m.client.orders if isinstance(o, dict)]) == 1)
 
     m2 = monitor(bid=0.80)
+    m2.now_et = at(12, 0)
     CONFIG["close_all_by_et"] = "23:59"      # nothing is past this
     check("outside the window, positions are left alone",
           m2._past_flatten_time() is False)
+
+    # v5.23: early close. Tradier's clock says the session ends at 13:00, so
+    # a 15:45 setting (15 min before a 16:00 close) must fire at 12:45.
+    CONFIG["close_all_by_et"] = "15:45"
+    orig_clock = ag._clock_cache
+    ag._clock_cache = (time.time(), "open", {"state": "open", "next_change": "13:00"})
+    m2.now_et = at(12, 50)
+    check("early close: flatten fires 15 min before a 13:00 close",
+          m2._past_flatten_time() is True)
+    m2.now_et = at(12, 40)
+    check("early close: not before the shifted window",
+          m2._past_flatten_time() is False)
+    ag._clock_cache = orig_clock
+    m2.now_et = at(15, 50)
+    check("normal day: 15:50 is inside the window", m2._past_flatten_time() is True)
+    m2.now_et = at(16, 10)
+    check("normal day: window ends at the close", m2._past_flatten_time() is False)
 
     CONFIG["flatten_eod"] = False
     check("flatten can be disabled", m2._past_flatten_time() is False)
@@ -1179,13 +1214,24 @@ def test_end_to_end():
     check("crash NOT armed → no orders at all (pre-v5 behaviour)",
           len(b3.orders) == 0, f"orders={b3.orders}")
 
-    # ── bull regime must still refuse a PUT signal ──
+    # ── bull regime: PUTs follow bull_allow_puts end to end (v5.22/v5.23) ──
+    # can_trade() used to hard-block bull PUTs off the raw regime, which
+    # silently undid bull_allow_puts. The overrides are now the only gate.
     bull = cm.RegimeReport(regime="bull", vix=14.0)
-    ov_bull = cm.overrides_for(bull, {"crash_mode_enabled": True})
+    ov_bull = cm.overrides_for(bull, {"crash_mode_enabled": True,
+                                      "bull_allow_puts": False})
     ov_bull["crash_mode"] = False
     b4 = FakeBroker()
     _cycle((bull, ov_bull, [sig]), b4)
-    check("bull regime blocks a PUT trade", len(b4.orders) == 0, f"orders={b4.orders}")
+    check("bull_allow_puts=False blocks a PUT trade", len(b4.orders) == 0,
+          f"orders={b4.orders}")
+    ov_bull = cm.overrides_for(bull, {"crash_mode_enabled": True})
+    ov_bull["crash_mode"] = False
+    b5 = FakeBroker()
+    _cycle((bull, ov_bull, [sig]), b5)
+    check("bull regime with default config places the PUT",
+          len([o for o in b5.orders if isinstance(o, dict)]) == 1,
+          f"orders={b5.orders}")
 
     # ── sizing must not compound VIX x regime multipliers into nothing ──
     b5 = FakeBroker()

@@ -62,10 +62,120 @@ _formatter = EasternFormatter("%(asctime)s [%(levelname)s] %(message)s")
 _handler_file.setFormatter(_formatter)
 _handler_stream.setFormatter(_formatter)
 logging.basicConfig(level=logging.INFO, handlers=[_handler_file, _handler_stream])
+
+# yfinance logs its own failures at ERROR straight through the root handler, so
+# they land in agent.log looking like agent faults. Every one of the 42 "errors"
+# on 2026-09-10 was this: delisted-ticker and Yahoo 401/crumb chatter from the
+# 09:00 screen. Silencing the library's logger leaves our own ERROR lines — the
+# Tradier SSL failure that day was real — as the only things in the count.
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
 log = logging.getLogger("OptionsAgent")
 
 
+def _state_dir() -> Path:
+    """Directory for files that persist across runs.
+
+    Defaults to the project directory, so production behaviour is unchanged.
+    _sandbox.py sets OPTIONSTRADER_STATE_DIR so the offline suite cannot write
+    the live agent's memory. Same contract as RiskManager._state_path.
+    """
+    base = os.environ.get("OPTIONSTRADER_STATE_DIR")
+    return Path(base) if base else Path(__file__).parent
+
+
+def cap_contracts(contracts: int, ask: float, equity: float,
+                  max_pct: float = 0.15) -> int:
+    """Cap one order at max_pct of account equity. Returns 0 to mean SKIP.
+
+    Sizing was the standing hole: $167 average order and 2.6 contracts on
+    roughly $680 of equity, with Aug 19 putting $898 into two AAPL calls and a
+    9-lot TSLA on about $1,150. A $70 daily loss limit cannot function when a
+    single order is a quarter of the account.
+
+    Deliberately never rounds up to 1. If one contract will not fit inside the
+    budget, the trade is too big for the account and the caller must skip it;
+    rounding up to 1 would reintroduce exactly the outsized order this exists
+    to prevent.
+    """
+    if ask <= 0 or equity <= 0:
+        return 0
+    return min(contracts, int((equity * max_pct) // (ask * 100)))
+
+
 # ── Tradier API Client ─────────────────────────────────────────────────────────
+_CLOCK_TTL   = 60      # seconds; the loop wakes far more often than this
+_clock_cache = None    # (fetched_at, state, clock), shared by every caller
+
+
+def market_state(client) -> str:
+    """Current session state: premarket, open, postmarket or closed.
+
+    Tradier owns the exchange calendar, so holidays and early closes come for
+    free. The gate used to be pure hour arithmetic, which is why 2026-09-07 —
+    Labor Day — produced a full-size log of the agent running a complete
+    session against a closed market.
+    """
+    global _clock_cache
+    now_s = time.time()
+    if _clock_cache and now_s - _clock_cache[0] < _CLOCK_TTL:
+        return _clock_cache[1]
+    try:
+        clk = (client.get_market_clock() or {}).get("clock", {}) or {}
+        state = str(clk.get("state", "")).lower()
+        if state in ("premarket", "open", "postmarket", "closed"):
+            if not _clock_cache or _clock_cache[1] != state:
+                log.info(f"\U0001f552 Market state: {state} "
+                         f"({clk.get('description', '')})")
+            _clock_cache = (now_s, state, clk)
+            return state
+        log.warning(f"Unrecognised market state {clk.get('state')!r} "
+                    f"\u2014 falling back to wall-clock arithmetic")
+    except Exception as e:
+        log.warning(f"Market clock fetch failed ({e}) "
+                    f"\u2014 falling back to wall-clock arithmetic")
+    return market_state_from_wallclock()
+
+
+def session_close_minutes(client) -> int | None:
+    """Today's close in minutes after midnight ET, or None if not knowable.
+
+    While the market is open, Tradier's clock.next_change IS the close:
+    "16:00" on a normal day, "13:00" on an early close (day after
+    Thanksgiving, Christmas Eve). A hardcoded 16:00 meant the EOD flatten was
+    scheduled for 15:45 on days the market shut at 13:00, so 0DTE positions
+    rode into expiry unsold. None when the market is not open or the clock
+    is unreachable; callers fall back to 16:00.
+    """
+    if market_state(client) != "open" or not _clock_cache or _clock_cache[1] != "open":
+        return None
+    try:
+        hh, mm = str((_clock_cache[2] or {}).get("next_change", "")).split(":")
+        return int(hh) * 60 + int(mm)
+    except ValueError:
+        return None
+
+
+def market_state_from_wallclock() -> str:
+    """Fallback for when Tradier's clock is unreachable.
+
+    This is the old behaviour and has no holiday awareness. Better than halting
+    on a transient API blip, but a holiday that coincides with a Tradier outage
+    will still look like a trading day.
+    """
+    et = datetime.now(pytz.timezone("America/New_York"))
+    if et.weekday() >= 5:
+        return "closed"
+    mins = et.hour * 60 + et.minute
+    if 9 * 60 <= mins < 9 * 60 + 30:
+        return "premarket"
+    if 9 * 60 + 30 <= mins < 16 * 60:
+        return "open"
+    if 16 * 60 <= mins < 20 * 60:
+        return "postmarket"
+    return "closed"
+
+
 class TradierClient:
     def __init__(self, token: str, sandbox: bool = True):
         self.token = token
@@ -87,6 +197,10 @@ class TradierClient:
 
     def get_account_balances(self):
         return self._get(f"/accounts/{CONFIG['account_id']}/balances")
+
+    def get_market_clock(self):
+        """clock.state is one of premarket, open, postmarket, closed."""
+        return self._get("/markets/clock")
 
     def get_positions(self):
         return self._get(f"/accounts/{CONFIG['account_id']}/positions")
@@ -210,7 +324,8 @@ class OptionsSelector:
         return None
 
     def select_deep_itm(self, signal: dict, capital: float,
-                        overrides: dict | None = None) -> Optional[dict]:
+                        overrides: dict | None = None,
+                        max_cost: float | None = None) -> Optional[dict]:
         """Level-2 downside structure: a deep ITM CALL on an inverse ETF.
 
         Two translations happen here.
@@ -254,6 +369,8 @@ class OptionsSelector:
         if not explicit:
             budget *= min(float(ov.get("size_mult", 1.0)),
                           float(signal.get("vix_size_mult", 1.0) or 1.0))
+        if max_cost is not None:
+            budget = min(budget, max_cost)   # per-order equity cap
         if budget <= 0:
             return None
         log.info(f"  💵 Deep ITM budget: ${budget:.0f} "
@@ -368,7 +485,8 @@ class OptionsSelector:
         }
 
     def select_spread(self, signal: dict, capital: float,
-                      overrides: dict | None = None) -> Optional[dict]:
+                      overrides: dict | None = None,
+                      max_cost: float | None = None) -> Optional[dict]:
         """Build a vertical debit spread for this signal, or None.
 
         Used when the regime layer sets ``prefer_spreads`` — i.e. implied
@@ -399,6 +517,8 @@ class OptionsSelector:
                 float(ov.get("size_mult", 1.0)),
                 float(signal.get("vix_size_mult", 1.0) or 1.0),
             )
+            if max_cost is not None:
+                budget = min(budget, max_cost)   # per-order equity cap
             if budget <= 0:
                 return None
 
@@ -429,7 +549,8 @@ class OptionsSelector:
             return None
 
     def select_contract(self, signal: dict, capital: float,
-                        overrides: dict | None = None) -> Optional[dict]:
+                        overrides: dict | None = None,
+                        max_cost: float | None = None) -> Optional[dict]:
         ov = overrides or {}
         ticker = signal["ticker"]
         direction = signal["direction"]
@@ -502,6 +623,10 @@ class OptionsSelector:
         size_multiplier *= min(vix_mult, regime_mult)
 
         max_spend = min(capital, CONFIG.get("max_trade_size", capital)) * size_multiplier
+        # v5.23 — the per-order equity cap bounds the search too, applied after
+        # the score multiplier: it is a ceiling on the order, not a new base.
+        if max_cost is not None:
+            max_spend = min(max_spend, max_cost)
         affordable = max_spend / 100.0
         min_px = float(CONFIG.get("min_contract_price", 0.20))
 
@@ -543,6 +668,8 @@ class OptionsSelector:
             # the ceiling, the delta band or a data problem did it.
             why = {"price": 0, "delta": 0, "no_greeks_far": 0,
                    "spread": 0, "error": 0}
+            # Bid/ask ceiling as a fraction of mid. See the gate below.
+            _max_spread = float(CONFIG.get("max_spread_pct", 0.15))
             seen: list[tuple] = []
             for opt in side_options:
                 try:
@@ -579,10 +706,17 @@ class OptionsSelector:
                             why["no_greeks_far"] += 1
                             continue
 
+                    # v5.22 — ceiling was a hardcoded 0.35. Measured across 183
+                    # live orders the bid/ask was median 4.7% and p90 18.2%,
+                    # and NOT ONE order exceeded 35%: the gate never bound, so
+                    # it was decoration. That matters because the spread is
+                    # paid twice — you buy at the ask and mark at the bid — so
+                    # a 20% spread costs more than the entire measured edge
+                    # (~7% of premium) before the trade has a chance.
                     mid = (ask + bid) / 2
                     if mid > 0:
                         spread_pct = (ask - bid) / mid
-                        if spread_pct > 0.35:
+                        if spread_pct > _max_spread:
                             why["spread"] += 1
                             continue
 
@@ -866,47 +1000,116 @@ class RiskManager:
         return base + (gains * 0.75)
 
     def _dynamic_max_positions(self) -> int:
+        """Concurrent position ceiling.
+
+        v5.22 — CONFIG["max_concurrent_positions"] was dead configuration.
+        This returned a hardcoded floor of 3 for any balance under $2,500, so
+        the configured value of 2 never applied and the file described
+        behaviour the code did not have. The ladder is kept for larger
+        balances, but the configured value is now an honoured ceiling.
+        """
         balance = self.get_account_balance()
         if balance >= 5000:
-            return 5
+            ladder = 5
         elif balance >= 2500:
-            return 4
+            ladder = 4
         else:
-            return 3
+            ladder = 3
+        configured = int(CONFIG.get("max_concurrent_positions", ladder))
+        return max(1, min(ladder, configured))
 
     def _dynamic_daily_loss_limit(self) -> float:
+        """Daily loss limit in dollars.
+
+        v5.22 — CONFIG["daily_loss_limit"] was dead configuration. This
+        returned balance * 0.14 and nothing read the configured $75, so on a
+        $609 account the real limit was $85.32 while the file said $75.
+
+        Both now apply and the TIGHTER one wins: the percentage keeps the
+        limit proportional as the account grows, and the configured dollar
+        figure caps it in absolute terms. Set daily_loss_limit to None to use
+        the percentage alone.
+        """
         balance = self.get_account_balance()
-        return round(balance * 0.14, 2)
+        pct_limit = round(balance * float(CONFIG.get("daily_loss_pct", 0.14)), 2)
+        hard = CONFIG.get("daily_loss_limit")
+        if hard is None:
+            return pct_limit
+        return round(min(pct_limit, float(hard)), 2)
 
     def get_open_position_count(self) -> int:
-        try:
-            pos = self.client.get_positions()
-            if not isinstance(pos, dict):
-                return 0
-            positions = pos.get("positions", {}).get("position", [])
-            if isinstance(positions, dict):
-                positions = [positions]
-            return len(positions)
-        except:
-            return 0
+        """Open position count, or -1 if it could not be determined.
 
-    def get_open_tickers(self) -> set:
+        v5.22 — this used to `return 0` from a bare `except:`, and every
+        caller compared it against the position ceiling. So any transient
+        Tradier error or malformed payload reported "no open positions" and
+        the max-positions check passed unconditionally. A risk check that
+        fails OPEN is worse than no check, because it is trusted.
+
+        -1 means unknown. can_trade() treats unknown as a hard stop.
+        """
         try:
             pos = self.client.get_positions()
             if not isinstance(pos, dict):
+                log.error("Position count: unexpected payload type "
+                          f"{type(pos).__name__} — treating as UNKNOWN")
+                return -1
+            positions = pos.get("positions", {})
+            # Tradier sends the string "null" when the account is flat. That
+            # is a real zero, not a failure, so it must not become -1.
+            if positions in (None, "null", ""):
+                return 0
+            if not isinstance(positions, dict):
+                log.error("Position count: unexpected 'positions' type "
+                          f"{type(positions).__name__} — treating as UNKNOWN")
+                return -1
+            position = positions.get("position", [])
+            if isinstance(position, dict):
+                position = [position]
+            if position is None:
+                return 0
+            return len(position)
+        except Exception as e:
+            log.error(f"Position count failed ({e}) — treating as UNKNOWN, "
+                      "no new entries this cycle")
+            return -1
+
+    def get_open_tickers(self) -> set | None:
+        """Tickers with an open position, or None if it could not be determined.
+
+        v5.22 — same fail-open defect as get_open_position_count: a bare
+        `except:` returned an empty set, which the caller reads as "nothing is
+        open" and therefore "no duplicate to avoid". The result would be a
+        second position stacked on a ticker already held, doubling single-name
+        concentration at the exact moment the broker API is misbehaving.
+        None means unknown; the caller skips the cycle.
+        """
+        try:
+            pos = self.client.get_positions()
+            if not isinstance(pos, dict):
+                log.error("Open tickers: unexpected payload — treating as UNKNOWN")
+                return None
+            positions = pos.get("positions", {})
+            if positions in (None, "null", ""):
+                return set()      # genuinely flat
+            if not isinstance(positions, dict):
+                log.error("Open tickers: unexpected 'positions' type — UNKNOWN")
+                return None
+            position = positions.get("position", [])
+            if isinstance(position, dict):
+                position = [position]
+            if position is None:
                 return set()
-            positions = pos.get("positions", {}).get("position", [])
-            if isinstance(positions, dict):
-                positions = [positions]
             tickers = set()
-            for p in positions:
-                symbol = p.get("symbol", "")
+            for p in position:
+                symbol = (p or {}).get("symbol", "")
                 m = re.match(r'^([A-Z]+)', symbol)
                 if m:
                     tickers.add(m.group(1))
             return tickers
-        except:
-            return set()
+        except Exception as e:
+            log.error(f"Open tickers failed ({e}) — treating as UNKNOWN")
+            return None
 
     def check_daily_loss_limit(self, current_capital: float) -> tuple[bool, str]:
         portfolio_value = self.get_account_balance()
@@ -952,6 +1155,11 @@ class RiskManager:
             return False, f"Insufficient capital: ${available_capital:.2f}"
 
         open_positions = self.get_open_position_count()
+        if open_positions < 0:
+            # Unknown, not zero. Entering here could stack positions on top of
+            # ones already open and silently blow through the ceiling.
+            return False, ("Open position count unavailable — refusing to "
+                           "enter blind")
         if open_positions >= self._dynamic_max_positions():
             return False, f"Max positions reached ({open_positions})"
 
@@ -986,14 +1194,16 @@ class RiskManager:
             return False, f"Blocked PUT — SPY up {spy_chg:.1f}% today"
 
         # ── Regime filter ──
+        # v5.23 — the overrides are the ONLY direction gate. This also used
+        # to hard-block "bull + PUT" and "bear + CALL" off the raw daily
+        # regime, which silently undid bull_allow_puts: v5.22 let bull-regime
+        # PUTs through the signal engine and this line rejected every one of
+        # them at the last step. The bear-CALL line was redundant (bear and
+        # crash overrides already set allow_calls False).
         if not ov.get("allow_calls", True) and direction == "CALL":
             return False, f"Hard block: CALL in {regime.upper()} regime"
         if not ov.get("allow_puts", True) and direction == "PUT":
             return False, f"Hard block: PUT in {regime.upper()} regime"
-        if regime == "bear" and direction == "CALL":
-            return False, f"Hard block: CALL in BEAR regime"
-        if regime == "bull" and direction == "PUT":
-            return False, f"Hard block: PUT in BULL regime"
 
         # ── Defined-risk sanity check for spreads ──
         # A vertical's maximum loss is the debit paid. If that somehow exceeds
@@ -1029,22 +1239,38 @@ class PositionMonitor:
         self._lock = threading.RLock()
         self._load_entry_prices()
 
+    def now_et(self) -> datetime:
+        """Injectable clock: tests assign an instance attribute over this.
+
+        The flatten tests used to pass only before 16:00 ET, and tests may
+        not run during market hours, so there was no clean window for them.
+        """
+        return datetime.now(pytz.timezone("America/New_York"))
+
     def _past_flatten_time(self) -> bool:
-        """True once we are inside the end-of-day flatten window."""
+        """True once we are inside the end-of-day flatten window.
+
+        v5.23 — anchored on the session's REAL close. close_all_by_et is
+        written against a 16:00 close; on an early close the same lead time
+        applies (15:45 → 12:45 on a 13:00 day). The window ends at the close.
+        """
         if not CONFIG.get("flatten_eod", True):
             return False
         try:
             hh, mm = str(CONFIG.get("close_all_by_et", "15:45")).split(":")
-            now = datetime.now(pytz.timezone("America/New_York"))
+            now = self.now_et()
             if now.weekday() >= 5:
                 return False
-            return (now.hour * 60 + now.minute) >= (int(hh) * 60 + int(mm)) \
-                and now.hour < 16
+            close = session_close_minutes(self.client) or 16 * 60
+            flatten_at = int(hh) * 60 + int(mm) - (16 * 60 - close)
+            return flatten_at <= now.hour * 60 + now.minute < close
         except Exception:
             return False
 
     def _entry_prices_path(self):
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "entry_prices.json")
+        # v5.22: honour OPTIONSTRADER_STATE_DIR. The .peaks and .spreads
+        # sidecars are built from this string, so they follow automatically.
+        return str(_state_dir() / "entry_prices.json")
 
     def _load_entry_prices(self):
         try:
@@ -1116,19 +1342,45 @@ class PositionMonitor:
 
     def _dynamic_tp_sl(self, signal_score: float, option_symbol: str = None) -> tuple:
         # Check for TradeJudge override first
+        # v5.22 — when TradeJudge sets only one side, the other used to fall
+        # back to a SECOND copy of the ladder with its own hardcoded numbers
+        # (45/42 and 25), which would silently diverge from config the moment
+        # take_profit_pct or stop_loss_pct changed. The partial override now
+        # fills its gap from the same ladder computed below.
+        _override_tp = _override_sl = None
         if option_symbol:
-            tp = self.entry_prices.get(option_symbol + "_tp")
-            sl = self.entry_prices.get(option_symbol + "_sl")
-            if tp or sl:
-                tp = tp or (45.0 if signal_score >= 16 else 42.0)
-                sl = sl or 25.0
-                return float(tp), float(sl)
+            _override_tp = self.entry_prices.get(option_symbol + "_tp")
+            _override_sl = self.entry_prices.get(option_symbol + "_sl")
+        # v5.22 — CONFIG["take_profit_pct"] and CONFIG["stop_loss_pct"] were
+        # dead keys: the file said 38/38 while this function returned a
+        # hardcoded 42-45 / 25. The ladder is kept (higher score earns a wider
+        # target) but it is now anchored on the configured values, so editing
+        # config.py actually changes exit behaviour.
+        #
+        # Why the stop matters more than it looks. You do not start a trade at
+        # zero: entry_limit_pad_pct sits the limit above the ask and the
+        # position marks at the bid, so with a 4.7% median spread you are
+        # ~4.7% under water the instant you fill. A 25% stop leaves ~20% of
+        # real room. Measured on 113 closed trades, losses averaged -28.7%
+        # against that -25% threshold and 72% of them finished worse than the
+        # stop, i.e. the stop is inside the noise and gaps through.
+        #
+        # Run ./venv/bin/python exit_study.py before changing these.
+        tp_base = float(CONFIG.get("take_profit_pct", 38.0))
+        sl_base = float(CONFIG.get("stop_loss_pct", 38.0))
         if signal_score >= 16:
-            return 45.0, 25.0
+            tp, sl = tp_base * 1.18, sl_base
         elif signal_score >= 14:
-            return 42.0, 25.0
+            tp, sl = tp_base * 1.10, sl_base
         else:
-            return 38.0, 25.0
+            tp, sl = tp_base, sl_base
+
+        # A TradeJudge value, where present, wins over the ladder.
+        if _override_tp:
+            tp = float(_override_tp)
+        if _override_sl:
+            sl = float(_override_sl)
+        return float(tp), float(sl)
 
     def check_and_exit(self):
         """Thread-safe entry point. Held for the whole pass, deliberately.
@@ -1287,12 +1539,7 @@ class PositionMonitor:
                         log.info(f"⏳ {symbol} — close order pending ({elapsed:.0f}s / {max_wait}s)")
                         continue
                     # Don't cancel/resubmit outside market hours — orders can't fill anyway
-                    _now_et = datetime.now(pytz.timezone("America/New_York"))
-                    _market_open = (
-                        (_now_et.hour == 9 and _now_et.minute >= 30) or
-                        (10 <= _now_et.hour <= 15)
-                    )
-                    if not _market_open:
+                    if market_state(self.client) != "open":
                         log.info(f"⏳ {symbol} — close order pending ({elapsed:.0f}s), market closed — holding until open")
                         continue
                     log.warning(f"⚠️  CLOSE TIMEOUT: {symbol} unfilled after {elapsed:.0f}s — canceling and going market")
@@ -1400,7 +1647,7 @@ class PositionMonitor:
                              f"{CONFIG.get('close_all_by_et', '15:45')} ET "
                              f"({pnl_pct:+.1f}%) — not carrying options "
                              f"overnight")
-                    self._close_position(symbol, qty, current_bid,
+                    self._close_position(symbol, qty, current_bid, entry_px=entry_price,
                                          use_market=True)
                     continue
 
@@ -1416,7 +1663,7 @@ class PositionMonitor:
                             self.time_extended.add(symbol)
                             continue
                         log.info(f"⏱️  TIME EXIT: {symbol} held {minutes_held:.0f}min ({pnl_pct:+.1f}%) | Selling {qty} contracts")
-                        self._close_position(symbol, qty, current_bid,
+                        self._close_position(symbol, qty, current_bid, entry_px=entry_price,
                                              use_market=force_market)
                         continue
 
@@ -1434,17 +1681,17 @@ class PositionMonitor:
                             f"🔒 TRAILING STOP: {symbol} peaked at +{peak_pnl_pct:.1f}%, "
                             f"pulled back {pullback_from_peak:.1f}% (trail: {trail_pct}%) | Selling {qty} contracts"
                         )
-                        self._close_position(symbol, qty, current_bid,
+                        self._close_position(symbol, qty, current_bid, entry_px=entry_price,
                                              use_market=force_market)
                         continue
 
                 if pnl_pct >= tp_pct:
                     log.info(f"✅ TAKE PROFIT: {symbol} +{pnl_pct:.1f}% (threshold: +{tp_pct}%) | Selling {qty} contracts")
-                    self._close_position(symbol, qty, current_bid,
+                    self._close_position(symbol, qty, current_bid, entry_px=entry_price,
                                          use_market=force_market)
                 elif pnl_pct <= -sl_pct:
                     log.info(f"🛑 STOP LOSS: {symbol} {pnl_pct:.1f}% (threshold: -{sl_pct}%) | Selling {qty} contracts")
-                    self._close_position(symbol, qty, current_bid,
+                    self._close_position(symbol, qty, current_bid, entry_px=entry_price,
                                          use_market=force_market)
                 else:
                     trail_info = f" | Peak: +{peak_pnl_pct:.1f}%" if peak_pnl_pct > 5 else ""
@@ -1458,7 +1705,7 @@ class PositionMonitor:
             log.error(f"Position monitor error: {e}")
 
     def _close_position(self, option_symbol: str, qty: int, bid: float,
-                        use_market: bool = False):
+                        use_market: bool = False, entry_px: float | None = None):
         m = re.match(r'^([A-Z]+)', option_symbol)
         ticker = m.group(1) if m else option_symbol[:6]
         try:
@@ -1476,7 +1723,12 @@ class PositionMonitor:
                     order_type="limit",
                     price=round(bid * 0.98, 2)
                 )
-            entry_price = self.entry_prices.get(option_symbol, bid)
+            # v5.23 — prefer the broker's cost basis (what was actually paid,
+            # and what the stop/TP logic already measures against). The
+            # recorded value is the ASK at signal time, so trade_results.json,
+            # TradeJudge's ticker history and every study built on them were
+            # off by the entry slippage on every trade.
+            entry_price = entry_px or self.entry_prices.get(option_symbol, bid)
             pnl_per_contract = (bid - entry_price) * 100
             total_pnl = pnl_per_contract * qty
             pnl_pct = ((bid - entry_price) / entry_price * 100) if entry_price else 0
@@ -1531,7 +1783,7 @@ class PositionMonitor:
                 "exit_time":     datetime.now(pytz.timezone("America/New_York")).isoformat(),
                 "regime":        getattr(self, "last_regime", "unknown"),
             }
-            results_file = Path(__file__).parent / "trade_results.json"
+            results_file = _state_dir() / "trade_results.json"
             with open(results_file, "a") as f:
                 f.write(json.dumps(record) + "\n")
         except Exception as e:
@@ -1593,9 +1845,14 @@ class OptionsAgent:
                                         not rep.ema_fast_cross_down)
         ov = self.regime_state.apply(_eff, ov)
         crash_mode.log_report(rep)
+        # v5.22 — `ov` is now passed through instead of being computed and
+        # dropped. It also carries min_signal_score, which crash mode RAISES;
+        # the sync path was using the base threshold in a crash.
         sigs = self.signals.get_top_signals(
-            min_score=CONFIG["min_signal_score"],
-            watchlist=self._resolve_watchlist(rep.regime))
+            min_score=float(ov.get("min_signal_score",
+                                   CONFIG["min_signal_score"])),
+            watchlist=self._resolve_watchlist(rep.regime),
+            overrides=ov)
         return rep, ov, sigs
 
     def _resolve_watchlist(self, regime: str) -> list | None:
@@ -1778,12 +2035,12 @@ class OptionsAgent:
             log.info(f"Re-entry {ticker}: score {score} below re-entry threshold {min_score}")
             return False
         if confluence < 4:
-            log.info(f"Re-entry {ticker}: confluence {confluence}/4 — need 3/3 for re-entry")
+            log.info(f"Re-entry {ticker}: confluence {confluence}/4 — need 4/4 for re-entry")
             return False
 
         # Check last trade result
         try:
-            results_file = Path(__file__).parent / "trade_results.json"
+            results_file = _state_dir() / "trade_results.json"
             if results_file.exists():
                 last_result = None
                 with open(results_file) as f:
@@ -1847,6 +2104,13 @@ class OptionsAgent:
             log.info(f"Cooldown set for {ticker} — no re-entry for 400s")
         self.monitor.recently_closed.clear()
 
+        # v5.23 — nothing is held overnight, so nothing new is opened inside
+        # the flatten window either. An entry at 15:50 would be dumped at
+        # market by the next monitor pass: paying the spread twice for nothing.
+        if self.monitor._past_flatten_time():
+            log.info("🌆 Inside the EOD flatten window — no new entries.")
+            return
+
         capital = self.risk.get_available_capital()
         cap_limit = self.risk._dynamic_capital_limit()
         log.info(f"Available capital: ${capital:.2f} (limit: ${cap_limit:.2f})")
@@ -1890,11 +2154,28 @@ class OptionsAgent:
                  f"({top_signals[0]['direction']}, score={top_signals[0]['score']})")
 
         open_tickers = self.risk.get_open_tickers()
+        if open_tickers is None:
+            log.warning("🚫 Cannot read open positions — skipping entries this "
+                        "cycle rather than risking a duplicate position.")
+            return
         now_ts = datetime.now().timestamp()
         trade = None
         best_signal = None
         # Iterate signals — already sorted by score from signal engine
         pending_tickers: set = set()
+
+        # v5.23 — the per-order equity cap now bounds the SEARCH, not just the
+        # result. It used to be applied only after selection, can_trade() and
+        # the paid TradeJudge call: the selector aimed at a 0.45-delta contract
+        # under max_trade_size ($300), the cap (~$91 on $609) then rejected it,
+        # and the cycle ended without trying the next signal. What survived was
+        # whatever happened to be cheap — the realised 0.29 median delta.
+        # Equity comes from Tradier every cycle, never from risk_state.json —
+        # that file holds the morning baseline, so mid-day it is stale in
+        # exactly the direction that matters after a drawdown.
+        _equity = self.risk.get_account_balance()
+        _max_pct = float(CONFIG.get("max_position_pct", 0.15))
+        _order_cap = _equity * _max_pct
 
         # Boost premarket watchlist tickers to front of queue
 
@@ -1925,9 +2206,11 @@ class OptionsAgent:
             structure = CONFIG.get("crash_structure", "deep_itm")
             if overrides.get("prefer_defined_risk"):
                 if structure == "deep_itm":
-                    t = self.selector.select_deep_itm(sig, effective_capital, overrides)
+                    t = self.selector.select_deep_itm(sig, effective_capital, overrides,
+                                                      max_cost=_order_cap)
                 elif structure == "spread":
-                    t = self.selector.select_spread(sig, effective_capital, overrides)
+                    t = self.selector.select_spread(sig, effective_capital, overrides,
+                                                    max_cost=_order_cap)
                 if not t and CONFIG.get("crash_allow_single_leg_fallback", False):
                     log.info(f"  ↩️  {ticker}: no {structure} structure — "
                              f"falling back to a plain single leg")
@@ -1939,9 +2222,21 @@ class OptionsAgent:
                              f"and single-leg fallback is disabled — standing down")
                     continue
             if not t:
-                t = self.selector.select_contract(sig, effective_capital, overrides)
+                t = self.selector.select_contract(sig, effective_capital, overrides,
+                                                  max_cost=_order_cap)
 
             if t:
+                # Backstop for the bounded search. Top-level "ask" is the
+                # per-contract cost for every structure (the debit for a
+                # vertical). Too big → next signal, not end of cycle.
+                _capped = cap_contracts(t["contracts"], float(t["ask"]), _equity, _max_pct)
+                if _capped == 0:
+                    log.info(f"  ⬜ {ticker}: ${float(t['ask']) * 100:.2f}/contract is over "
+                             f"the ${_order_cap:.2f} position cap — trying next signal")
+                    continue
+                if _capped < t["contracts"]:
+                    t["contracts"] = _capped
+                    t["total_cost"] = _capped * float(t["ask"]) * 100
                 if t.get("structure") == "deep_itm":
                     d = t["deep_itm"]
                     log.info(
@@ -1999,6 +2294,38 @@ class OptionsAgent:
                 log.info(f"🤖 TradeJudge resized: {original_contracts} → {trade['contracts']} contracts ({size_multiplier}x)")
 
         is_spread = trade.get("structure") == "vertical_debit"
+
+        # ── Position cap: no single order above max_pct of equity ──────────
+        # Re-checked after TradeJudge, which can size UP (STRONG_BUY 1.25x).
+        # _equity and _max_pct were read before the candidate loop.
+        # A spread's per-contract cost is its debit, not the long leg's ask.
+        _unit = float(trade["spread"]["debit"]) if is_spread else float(trade["ask"])
+        _capped = cap_contracts(trade["contracts"], _unit, _equity, _max_pct)
+        if _capped == 0:
+            log.warning(
+                f"🚫 SKIP {trade['ticker']}: one contract at ${_unit:.2f} costs "
+                f"${_unit * 100:.2f}, over the "
+                f"${_equity * _max_pct:.2f} cap ({_max_pct:.0%} of ${_equity:.2f})."
+            )
+            return
+        if _capped < trade["contracts"]:
+            log.info(f"📉 Position cap: {trade['contracts']} → {_capped} contracts "
+                     f"({_max_pct:.0%} of ${_equity:.2f} = ${_equity * _max_pct:.2f})")
+            trade["contracts"] = _capped
+            # v5.22 — this used trade["ask"] unconditionally. For a vertical
+            # the per-contract cost is the DEBIT, not the long leg's ask, so
+            # recapping a spread inflated its total_cost (ask > debit always).
+            # The inflated figure then had to clear can_trade()'s capital and
+            # dynamic-limit checks, so spreads were rejected on a cost they
+            # never actually incurred. _unit is already the right number —
+            # debit for a spread, ask otherwise — so use it.
+            #
+            # This is a candidate answer to the open question in Claude.md:
+            # "has the vertical_debit / deep_itm path ever placed a live
+            # order?" On a $609 account the 15% cap binds on nearly every
+            # order, so this branch ran nearly every time a spread was tried.
+            trade["total_cost"] = _capped * _unit * 100
+
         if is_spread:
             sp = trade["spread"]
             log.info(f"EXECUTING: {trade['contracts']}x {trade['ticker']} "
@@ -2024,7 +2351,8 @@ class OptionsAgent:
                     log.warning(f"⚠️  Multileg order rejected ({me}) — "
                                 f"falling back to single long leg. If this repeats, "
                                 f"your Tradier account likely needs options level 3.")
-                    trade = self.selector.select_contract(best_signal, effective_capital, overrides)
+                    trade = self.selector.select_contract(best_signal, effective_capital, overrides,
+                                                          max_cost=_order_cap)
                     if not trade:
                         log.info("No single-leg fallback available — skipping cycle.")
                         return
@@ -2034,6 +2362,19 @@ class OptionsAgent:
                     if size_multiplier != 1.0:
                         trade["contracts"] = max(1, round(trade["contracts"] * size_multiplier))
                         trade["total_cost"] = trade["contracts"] * trade["ask"] * 100
+                    # Re-cap: select_contract() sized this leg against
+                    # effective_capital and knows nothing about the cap above.
+                    _capped = cap_contracts(trade["contracts"], float(trade["ask"]),
+                                            _equity, _max_pct)
+                    if _capped == 0:
+                        log.warning(f"🚫 SKIP {trade['ticker']}: single-leg fallback "
+                                    f"at ${trade['ask']:.2f} exceeds the position cap.")
+                        return
+                    if _capped < trade["contracts"]:
+                        log.info(f"📉 Position cap (fallback): "
+                                 f"{trade['contracts']} → {_capped} contracts")
+                        trade["contracts"] = _capped
+                        trade["total_cost"] = _capped * trade["ask"] * 100
                     result = self.client.place_order(
                         symbol=trade["ticker"],
                         option_symbol=trade["option_symbol"],
@@ -2092,7 +2433,12 @@ class OptionsAgent:
                 log.info(f"📊 Deep ITM TP/SL: +{tp_sl_override['tp']}% / "
                          f"-{tp_sl_override['sl']}%")
 
-            sl_hint = best_signal.get("sl_hint")
+            # v5.23 — off by default. The hint widened the stop to 28-40% on
+            # cheap contracts whenever TradeJudge did not nudge, overriding
+            # stop_loss_pct on most trades, and it was priced off the ATM
+            # option rather than the contract actually bought. exit_study.py
+            # found tighter stops win monotonically (SL 25 beats 38 beats 45).
+            sl_hint = best_signal.get("sl_hint") if CONFIG.get("use_sl_hint", False) else None
             if sl_hint and (tp_sl_override is None or tp_sl_override.get("sl") is None):
                 tp_sl_override = tp_sl_override or {}
                 tp_sl_override["sl"] = sl_hint
@@ -2139,11 +2485,23 @@ class OptionsAgent:
                 log.info(f"✅ FILLED {o.get('exec_quantity')} @ ${px}")
                 return True, "filled"
             if status in ("rejected", "canceled", "expired", "error"):
+                # A partial fill followed by a cancel still left us holding
+                # contracts. Report it as filled so the entry gets recorded.
+                if self._exec_qty(o) > 0:
+                    return True, f"partially filled, then {status}"
                 reason = o.get("reason_description") or "no reason given"
                 return False, f"{status.upper()} — {reason}"
             if status == "partially_filled":
+                # v5.23 — cancel the remainder. Returning here used to leave
+                # the unfilled part working, free to fill minutes later into
+                # a market we no longer read: the exact resting order the
+                # timeout branch below exists to prevent.
                 log.info(f"◐ Partial fill: {o.get('exec_quantity')}/"
-                         f"{o.get('quantity')}")
+                         f"{o.get('quantity')} — cancelling the remainder")
+                try:
+                    self.client.cancel_order(order_id)
+                except Exception as e:
+                    log.error(f"   Cancel of remainder failed: {e} — CHECK TRADIER MANUALLY")
                 return True, "partially filled"
             time.sleep(2)
 
@@ -2155,7 +2513,22 @@ class OptionsAgent:
             self.client.cancel_order(order_id)
         except Exception as e:
             log.error(f"   Cancel failed: {e} — CHECK TRADIER MANUALLY")
+        # It can fill between the last poll and the cancel. Look once more so
+        # a position we do own is not left unrecorded.
+        try:
+            if self._exec_qty(self.client.get_order(order_id)) > 0:
+                log.info(f"◐ Order {order_id} filled (at least partly) before the cancel")
+                return True, "filled before cancel"
+        except Exception:
+            pass
         return False, f"timed out unfilled after {timeout:.0f}s"
+
+    @staticmethod
+    def _exec_qty(o) -> float:
+        try:
+            return float((o or {}).get("exec_quantity") or 0)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _write_daily_summary(self):
         eastern = pytz.timezone("America/New_York")
@@ -2183,6 +2556,13 @@ class OptionsAgent:
             while True:
                 time.sleep(30)
                 try:
+                    # v5.23 — exits only while the market is open. This ran
+                    # around the clock, so stops and time exits could fire on
+                    # stale after-hours quotes, and a zero bid flipped them to
+                    # MARKET orders that then filled at the next open at
+                    # whatever price was there. run_once is already gated.
+                    if market_state(self.client) != "open":
+                        continue
                     # ── FIX 4: Removed log suppression — TP/SL/trailing stops always logged ──
                     # Previously setLevel(WARNING) was silencing all INFO logs in the fast monitor,
                     # meaning take profits and stop losses fired here were invisible in the log.
@@ -2292,38 +2672,33 @@ class OptionsAgent:
                 minute  = now.minute
                 weekday = now.weekday()
 
-                if weekday >= 5:
-                    log.info("Weekend. Markets closed. Sleeping 1hr.")
-                    time.sleep(3600)
-                    continue
-
                 if hour == 16 and minute < 5 and last_summary_date != now.date():
                     self._write_daily_summary()
                     self.trades_today = []
                     last_summary_date = now.date()
 
-                market_open = (
-                    (hour == 9 and minute >= 30) or
-                    (10 <= hour <= 14) or
-                    (hour == 15 and minute <= 59)
-                )
+                # v5.22: the exchange calendar decides, not the wall clock.
+                state = market_state(self.client)
 
-                # Pre-market scan window: 9:00-9:29am
-                premarket = (hour == 9 and minute < 30)
-                if premarket:
+                # The 09:00 catalyst/insider screen is allowed to run premarket.
+                # On a holiday Tradier reports "closed" all day, so it does not.
+                if state == "premarket":
                     if not getattr(self, '_premarket_scanned_today', None) == now.date():
                         self.run_premarket_scan()
                         self._premarket_scanned_today = now.date()
-                    log.info(f"Pre-market hours ({hour}:{minute:02d} ET). Sleeping 2min.")
+                    log.info(f"Pre-market ({hour}:{minute:02d} ET). Sleeping 2min.")
                     time.sleep(120)
                     continue
 
-                if not market_open:
-                    # Clear premarket watchlist after market closes
+                if state != "open":
                     if hour >= 16:
                         self.premarket_watchlist = []
-                    log.info(f"Outside market hours ({hour}:{minute:02d} ET). Sleeping 5min.")
-                    time.sleep(300)
+                    if state == "closed" and (weekday >= 5 or hour >= 20 or hour < 4):
+                        log.info(f"Market closed ({now:%a} {hour}:{minute:02d} ET). Sleeping 1hr.")
+                        time.sleep(3600)
+                    else:
+                        log.info(f"Market {state} ({hour}:{minute:02d} ET). Sleeping 5min.")
+                        time.sleep(300)
                     continue
 
                 self.run_once()

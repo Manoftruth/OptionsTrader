@@ -51,6 +51,8 @@ STATE_FILE = "regime_state.json"
 
 DEFAULTS = {
     "regime_state_machine":     True,
+    # False: CRASH exits straight to NORMAL, no RECOVERY stand-down.
+    "recovery_enabled":         False,
     # Leaving CRASH: votes must fall to at most this, and stay there.
     "crash_exit_votes":         1,
     "crash_exit_cycles":        3,
@@ -146,6 +148,11 @@ class RegimeState:
                 self.calm_cycles += 1
                 need = self.conf["crash_exit_cycles"]
                 if self.calm_cycles >= need:
+                    if not self.conf.get("recovery_enabled", True):
+                        self._enter("normal",
+                                    f"crash votes at {votes} for {need} cycles — "
+                                    f"RECOVERY disabled, resuming normal trading")
+                        return rep.regime
                     self._enter("recovery",
                                 f"crash votes at {votes} for {need} cycles — "
                                 f"standing down until the tape proves itself")
@@ -161,8 +168,12 @@ class RegimeState:
             return "crash"
 
         if self.state == "recovery":
+            if not self.conf.get("recovery_enabled", True):
+                self._enter("normal", "RECOVERY disabled in config")
+                return rep.regime
             ok, why = self._recovery_ok(vix, term, above_ema20)
             if ok:
+                self._last_block = None
                 if today not in self.confirm_days:
                     self.confirm_days.append(today)
                     log.info(f"   🧭 RECOVERY: clean session {today} "
@@ -180,6 +191,9 @@ class RegimeState:
                              f"(was {len(self.confirm_days)} day(s))")
                     self.confirm_days = []
                     self._save()
+                elif why != getattr(self, "_last_block", None):
+                    log.info(f"   🧭 RECOVERY: not clean yet — {why}")
+                self._last_block = why
             return "recovery"
 
         return rep.regime

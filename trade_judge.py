@@ -43,6 +43,7 @@ Cost: ~$0.002 per call (2 API calls for multi-turn) — still negligible.
 
 import json
 import logging
+import os
 import requests
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -72,7 +73,11 @@ YFINANCE_TIMEOUT = 8
 
 class TradeJudge:
 
-    RESULTS_FILE = Path(__file__).parent / "trade_results.json"
+    # v5.22: honour OPTIONSTRADER_STATE_DIR (see agent._state_dir). Resolved at
+    # import time, and _sandbox sets the variable before any project import.
+    RESULTS_FILE = Path(
+        os.environ.get("OPTIONSTRADER_STATE_DIR") or Path(__file__).parent
+    ) / "trade_results.json"
 
     def __init__(self):
         self.api_url = "https://api.anthropic.com/v1/messages"

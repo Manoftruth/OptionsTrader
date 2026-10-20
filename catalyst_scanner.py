@@ -317,13 +317,15 @@ class CatalystScanner:
             "NFLX","SPOT","PINS","TWLO","ZM","DOCN","GTLB","BILL",
             # AI / cloud
             "ORCL","CRM","NOW","SNOW","DDOG","MDB","NET","ZS",
-            "CRWD","S","PANW","OKTA","HUBS","CFLT","AI","SOUN",
+            # CFLT delisted — removed 2026-09-10, it was 12 of the morning's errors
+            "CRWD","S","PANW","OKTA","HUBS","AI","SOUN",
             # Finance / crypto adjacent
             "PYPL","AFRM","SOFI","UPST","LC","NU","MELI",
             "GS","MS","JPM","BAC","C","WFC","SCHW","IBKR",
             # Biotech / pharma
             "MRNA","BNTX","NVAX","BIIB","GILD","REGN","VRTX",
-            "LLY","PFE","ABBV","BMY","AMGN","ILMN","INCY","EXAS",
+            # EXAS delisted — removed 2026-09-10
+            "LLY","PFE","ABBV","BMY","AMGN","ILMN","INCY",
             # Consumer / retail
             "TGT","WMT","COST","LULU","NKE","DKNG","MGM","WYNN",
             # Energy

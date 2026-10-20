@@ -385,6 +385,9 @@ def overrides_for(rep: RegimeReport, base_config: dict) -> dict:
     """
     conf = {**DEFAULTS, **base_config}
     ov: dict[str, Any] = {}
+    # v5.23: score bonus for a signal that agrees with the DAILY regime
+    # (bull+CALL, bear+PUT). It was a hardcoded 2. See signal_engine.score_core.
+    ov["regime_align_bonus"] = float(base_config.get("regime_align_bonus", 2.0))
 
     # Corrupt data → trade nothing this cycle. Not "trade smaller": nothing.
     if not rep.integrity_ok:
@@ -452,7 +455,30 @@ def overrides_for(rep: RegimeReport, base_config: dict) -> dict:
 
     elif rep.regime == "bull":
         ov["allow_calls"] = True
-        ov["allow_puts"] = False
+        # v5.22 — PUTs are no longer blocked in a bull regime by default.
+        #
+        # _market_regime() is a DAILY measure: SPY price > EMA20 > EMA50 on
+        # daily bars. In a secular uptrend it returns "bull" almost always —
+        # 93.5% of 8,115 shadow signals. It was being used to veto intraday
+        # 30-60 minute signals, which is a timescale mismatch: where SPY sits
+        # against its 50-day EMA says nothing about the next hour.
+        #
+        # The cost was measured, not theorised. From shadow_resolved.jsonl:
+        #
+        #            n     60m hit    mean 60m move
+        #   CALL   4192     46.3%        -0.0805%
+        #   PUT    3898     51.8%        +0.0952%
+        #   z = +4.94, p < 0.00001
+        #
+        # PUTs are the only side with a positive measured edge, and 783
+        # bull-regime PUT signals were discarded by this gate with a +0.102%
+        # mean forward move — the best cohort in the dataset. Meanwhile 28 of
+        # the last 29 live orders were CALLs. The bot was structurally pinned
+        # to its losing side.
+        #
+        # Set bull_allow_puts False to restore the old calls-only behaviour.
+        # Verify any change with:  ./venv/bin/python edge_study.py
+        ov["allow_puts"] = bool(base_config.get("bull_allow_puts", True))
         ov["size_mult"] = 1.0
         # Deep-ITM routing is a downside structure only; a bullish signal has
         # no inverse-ETF translation, so it takes the ordinary path.

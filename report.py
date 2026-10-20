@@ -9,8 +9,11 @@ Usage:
 """
 
 import argparse
+import gzip
 import json
+import os
 import re
+import sys
 import requests
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -29,35 +32,125 @@ def parse_args():
     if args.since:
         try:
             since = datetime.strptime(args.since, "%Y-%m-%d").date()
-            print(f"  [filter] Reporting from {since} onward", flush=True)
         except ValueError:
-            print(f"  [filter] Invalid --since date '{args.since}', ignoring filter", flush=True)
+            # Hard fail. This used to print "ignoring filter" and carry on with
+            # since=None, so a typo silently produced an all-time report that
+            # looked exactly like the windowed one you asked for.
+            sys.stderr.write(
+                f"ERROR: --since '{args.since}' is not a valid YYYY-MM-DD date.\n"
+            )
+            sys.exit(2)
+        print(f"  [filter] Reporting from {since} onward", flush=True)
     return since
 
 
 def load_trades(path="trades.json", since=None) -> list:
+    """Load trades.json, dropping records that cannot be real fills.
+
+    Three test runs (2026-08-12, 08-18, 08-25) wrote 74 mock-chain candidates
+    into the production file: symbol roots of OPT and ETF instead of the
+    ticker, SPY strikes at $100, deltas of exactly 0.5, bid equal to ask and
+    expiries already in the past. They were removed on 2026-09-10, but nothing
+    stopped them going back in, and every number in this report is computed
+    over whatever this function returns.
+    """
     trades = []
+    dropped_symbol = dropped_expiry = malformed = 0
+
     try:
         with open(path) as f:
             for line in f:
                 line = line.strip()
-                if line:
-                    try:
-                        t = json.loads(line)
-                        if since:
-                            time_str = t.get("time", "")
-                            if time_str and datetime.strptime(time_str[:10], "%Y-%m-%d").date() < since:
+                if not line:
+                    continue
+                try:
+                    t = json.loads(line)
+                except Exception:
+                    malformed += 1
+                    continue
+
+                if since:
+                    time_str = t.get("time", "")
+                    if time_str:
+                        try:
+                            if datetime.strptime(time_str[:10], "%Y-%m-%d").date() < since:
                                 continue
-                        trades.append(t)
-                    except:
-                        continue
+                        except ValueError:
+                            malformed += 1
+                            continue
+
+                ticker = t.get("ticker") or ""
+                osym   = t.get("option_symbol") or ""
+                expiry = t.get("expiry") or ""
+                tdate  = (t.get("time") or "")[:10]
+
+                # The OCC root must be the ticker. This is the same test as the
+                # jq that cleaned the file: .option_symbol[0:(.ticker|length)].
+                if ticker and osym and osym[:len(ticker)] != ticker:
+                    dropped_symbol += 1
+                    continue
+
+                # An option cannot be bought after it expired.
+                if expiry and tdate and expiry < tdate:
+                    dropped_expiry += 1
+                    continue
+
+                trades.append(t)
     except FileNotFoundError:
         print(f"WARNING: {path} not found")
+
+    total_dropped = dropped_symbol + dropped_expiry + malformed
+    if total_dropped:
+        print(f"  [validate] dropped {total_dropped} record(s) from {path}: "
+              f"{dropped_symbol} symbol-root mismatch, "
+              f"{dropped_expiry} expiry before trade date, "
+              f"{malformed} unparseable", flush=True)
+    else:
+        print(f"  [validate] {len(trades)} record(s) loaded, none dropped", flush=True)
+
     return trades
 
 
+def _rotated_log_files(path="agent.log"):
+    """agent.log and its logrotate siblings, oldest first.
+
+    logrotate runs daily with rotate 14, compress and delaycompress, so the set
+    is agent.log (today), agent.log.1 (yesterday, still uncompressed because of
+    delaycompress) and agent.log.2.gz through agent.log.14.gz. Oldest first so
+    the carried-forward date only ever moves forward.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    base = os.path.basename(path)
+    found = []
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    for name in names:
+        if name == base:
+            found.append((0, os.path.join(directory, name)))
+            continue
+        m = re.match(re.escape(base) + r"\.(\d+)(\.gz)?$", name)
+        if m:
+            found.append((int(m.group(1)), os.path.join(directory, name)))
+    return [fp for _, fp in sorted(found, key=lambda x: -x[0])]
+
+
+def _open_log(fp):
+    if fp.endswith(".gz"):
+        return gzip.open(fp, "rt", encoding="utf-8", errors="replace")
+    return open(fp, encoding="utf-8", errors="replace")
+
+
 def parse_log(path="agent.log", since=None) -> dict:
-    """Extract key events from agent.log without loading the whole file."""
+    """Extract key events from the agent logs covering the --since window.
+
+    This used to read today's agent.log only, while TRADE SUMMARY covered the
+    whole --since range and P&L covered whatever the last 500 Tradier events
+    happened to span. Three sections, three different windows, one header.
+    Everything derived from these counts — the take-profit rate in
+    AUTO-ANALYSIS above all — was describing a single day.
+    """
     stats = {
         "total_cycles":        0,
         "no_signal_cycles":    0,
@@ -71,6 +164,9 @@ def parse_log(path="agent.log", since=None) -> dict:
         "blocked_reasons":     defaultdict(int),
         "signal_scores_seen":  [],
         "tickers_scanned":     defaultdict(int),
+        "log_files_read":      [],
+        "log_date_min":        None,
+        "log_date_max":        None,
     }
 
     false_positive_patterns = [
@@ -88,79 +184,97 @@ def parse_log(path="agent.log", since=None) -> dict:
     ts_re   = re.compile(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})")
     date_re = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
-    current_line_date = None  # last known date, carried forward for timestamp-less lines
+    files = _rotated_log_files(path)
+    if not files:
+        print(f"WARNING: {path} not found")
+        return stats
 
-    try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                # --- Always update date BEFORE the skip check ---
-                # Prefer a leading timestamp (most reliable); fall back to any date in line.
-                tm = ts_re.match(line)
-                if tm:
-                    try:
-                        current_line_date = datetime.strptime(tm.group(1), "%Y-%m-%d").date()
-                    except ValueError:
-                        pass
-                else:
-                    dm = date_re.search(line)
-                    if dm:
+    for fp in files:
+        current_line_date = None   # reset per file; files are read oldest first
+        used = False
+        try:
+            with _open_log(fp) as f:
+                for line in f:
+                    # --- Always update date BEFORE the skip check ---
+                    tm = ts_re.match(line)
+                    if tm:
                         try:
-                            current_line_date = datetime.strptime(dm.group(1), "%Y-%m-%d").date()
+                            current_line_date = datetime.strptime(tm.group(1), "%Y-%m-%d").date()
                         except ValueError:
                             pass
+                    else:
+                        dm = date_re.search(line)
+                        if dm:
+                            try:
+                                current_line_date = datetime.strptime(dm.group(1), "%Y-%m-%d").date()
+                            except ValueError:
+                                pass
 
-                # Apply date filter — skip lines before `since`
-                if since and current_line_date and current_line_date < since:
-                    continue
+                    # Apply date filter — skip lines before `since`
+                    if since and current_line_date and current_line_date < since:
+                        continue
 
-                line_lower = line.lower()
+                    if current_line_date:
+                        used = True
+                        if stats["log_date_min"] is None or current_line_date < stats["log_date_min"]:
+                            stats["log_date_min"] = current_line_date
+                        if stats["log_date_max"] is None or current_line_date > stats["log_date_max"]:
+                            stats["log_date_max"] = current_line_date
 
-                if "OptionsAgent cycle" in line or "[CYCLE]" in line or "--- scan cycle" in line.lower():
-                    stats["total_cycles"] += 1
+                    line_lower = line.lower()
 
-                if "no high-confidence signals" in line_lower or "no signals found" in line_lower:
-                    stats["no_signal_cycles"] += 1
+                    if "OptionsAgent cycle" in line or "[CYCLE]" in line or "--- scan cycle" in line.lower():
+                        stats["total_cycles"] += 1
 
-                elif "risk manager blocked" in line_lower:
-                    stats["blocked_trades"] += 1
-                    reason = line.split("Risk manager blocked:")[-1].strip() if "Risk manager blocked:" in line else "unknown"
-                    stats["blocked_reasons"][reason[:60]] += 1
+                    if "no high-confidence signals" in line_lower or "no signals found" in line_lower:
+                        stats["no_signal_cycles"] += 1
 
-                elif "kill switch" in line_lower and any(w in line_lower for w in ("fired", "triggered", "activated", "🚨")):
-                    stats["kill_switch_fires"] += 1
+                    elif "risk manager blocked" in line_lower:
+                        stats["blocked_trades"] += 1
+                        reason = line.split("Risk manager blocked:")[-1].strip() if "Risk manager blocked:" in line else "unknown"
+                        stats["blocked_reasons"][reason[:60]] += 1
 
-                elif ("✅ take profit:" in line_lower or "🎯 take profit:" in line_lower
-                      or ("take profit" in line_lower and "selling" in line_lower)):
-                    stats["take_profits"] += 1
+                    elif "kill switch" in line_lower and any(w in line_lower for w in ("fired", "triggered", "activated", "\U0001f6a8")):
+                        stats["kill_switch_fires"] += 1
 
-                elif ("🛑 stop loss:" in line_lower or "❌ stop loss:" in line_lower
-                      or ("stop loss" in line_lower and "selling" in line_lower)):
-                    stats["stop_losses"] += 1
+                    elif ("\u2705 take profit:" in line_lower or "\U0001f3af take profit:" in line_lower
+                          or ("take profit" in line_lower and "selling" in line_lower)):
+                        stats["take_profits"] += 1
 
-                elif "vix" in line_lower and "skipping scan" in line_lower:
-                    stats["vix_skipped"] += 1
+                    elif ("\U0001f6d1 stop loss:" in line_lower or "\u274c stop loss:" in line_lower
+                          or ("stop loss" in line_lower and "selling" in line_lower)):
+                        stats["stop_losses"] += 1
 
-                elif line.strip().startswith("ERROR") or " ERROR " in line or "[ERROR]" in line:
-                    if not any(fp in line_lower for fp in false_positive_patterns):
-                        stats["errors"] += 1
+                    elif "vix" in line_lower and "skipping scan" in line_lower:
+                        stats["vix_skipped"] += 1
 
-                if "market regime:" in line_lower:
-                    regime = line.split(":")[-1].strip().lower().split()[0]
-                    if regime in ("bull", "bear", "neutral"):
-                        stats["regime_counts"][regime] += 1
+                    elif line.strip().startswith("ERROR") or " ERROR " in line or "[ERROR]" in line:
+                        if not any(fp_pat in line_lower for fp_pat in false_positive_patterns):
+                            stats["errors"] += 1
 
-                if "score=" in line:
-                    m = re.search(r"score=([\d.]+)", line)
-                    if m:
-                        stats["signal_scores_seen"].append(float(m.group(1)))
+                    if "market regime:" in line_lower:
+                        regime = line.split(":")[-1].strip().lower().split()[0]
+                        if regime in ("bull", "bear", "neutral"):
+                            stats["regime_counts"][regime] += 1
 
-                if "✅" in line:
-                    m = re.search(r"✅\s+([A-Z]{1,6})[:\s]", line)
-                    if m:
-                        stats["tickers_scanned"][m.group(1)] += 1
+                    if "score=" in line:
+                        m = re.search(r"score=([\d.]+)", line)
+                        if m:
+                            stats["signal_scores_seen"].append(float(m.group(1)))
 
-    except FileNotFoundError:
-        print(f"WARNING: {path} not found")
+                    if "\u2705" in line:
+                        m = re.search(r"\u2705\s+([A-Z]{1,6})[:\s]", line)
+                        if m:
+                            stats["tickers_scanned"][m.group(1)] += 1
+        except (FileNotFoundError, OSError, EOFError) as e:
+            print(f"  [log] skipped {os.path.basename(fp)}: {e}", flush=True)
+            continue
+
+        if used:
+            stats["log_files_read"].append(os.path.basename(fp))
+
+    print(f"  [log] read {len(stats['log_files_read'])} file(s) "
+          f"covering {stats['log_date_min']} \u2192 {stats['log_date_max']}", flush=True)
 
     return stats
 
@@ -207,6 +321,52 @@ def analyze_trades(trades: list) -> dict:
 
 # ── P&L from Tradier ──────────────────────────────────────────────────────────
 
+_OCC_RE = re.compile(r"^([A-Z]+)(\d{2})(\d{2})(\d{2})([CP])(\d{8})$")
+
+
+def _occ_expiry(symbol):
+    """Expiry date encoded in an OCC symbol, or None if it is not one."""
+    m = _OCC_RE.match(symbol or "")
+    if not m:
+        return None
+    try:
+        return datetime(2000 + int(m.group(2)), int(m.group(3)), int(m.group(4))).date()
+    except ValueError:
+        return None
+
+
+def _tradier_history(base_url, headers, account_id, start, end,
+                     page_limit=500, max_pages=40):
+    """Every history event in [start, end], following pages to the end.
+
+    The old code took one limit=500 page and stopped. The account already holds
+    604 events, so February and March fell off the end and every P&L number
+    derived from this feed was quietly short a couple of months.
+    """
+    events, page = [], 1
+    while page <= max_pages:
+        resp = requests.get(
+            f"{base_url}/v1/accounts/{account_id}/history",
+            headers=headers,
+            params={"limit": page_limit, "page": page, "start": start, "end": end},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        history = resp.json().get("history")
+        if not history or history == "null":
+            break
+        batch = history.get("event", [])
+        if isinstance(batch, dict):
+            batch = [batch]
+        if not batch:
+            break
+        events.extend(batch)
+        if len(batch) < page_limit:
+            break
+        page += 1
+    return events
+
+
 def fetch_pnl_from_tradier(trades: list, since=None) -> dict:
     """
     Query Tradier account history to calculate P&L.
@@ -232,59 +392,41 @@ def fetch_pnl_from_tradier(trades: list, since=None) -> dict:
 
     print(f"  [Tradier] Using {'SANDBOX' if sandbox else 'LIVE'} endpoint", flush=True)
 
-    all_events = []
-    for limit in [500]:
+    # Same window as the other two sections, pushed down to the API instead of
+    # being filtered out of an arbitrary first page.
+    start = str(since) if since else "2020-01-01"
+    end   = datetime.now().strftime("%Y-%m-%d")
+
+    try:
+        all_events = _tradier_history(base_url, headers, account_id, start, end)
+    except Exception as e:
+        return {"error": f"Tradier API error: {e}"}
+
+    if not all_events and sandbox:
+        print("  [Tradier] Sandbox returned nothing — trying LIVE endpoint...", flush=True)
         try:
-            resp = requests.get(
-                f"{base_url}/v1/accounts/{account_id}/history",
-                headers=headers,
-                params={"limit": limit, "type": "trade"},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            all_events = _tradier_history("https://api.tradier.com", headers,
+                                          account_id, start, end)
         except Exception as e:
-            return {"error": f"Tradier API error: {e}"}
+            return {"error": f"Tradier live fallback error: {e}"}
 
-        history = data.get("history", {})
-        if not history or history == "null":
-            if sandbox:
-                print("  [Tradier] Sandbox returned nothing — trying LIVE endpoint...", flush=True)
-                try:
-                    resp2 = requests.get(
-                        f"https://api.tradier.com/v1/accounts/{account_id}/history",
-                        headers=headers,
-                        params={"limit": limit, "type": "trade"},
-                        timeout=15,
-                    )
-                    resp2.raise_for_status()
-                    data = resp2.json()
-                    history = data.get("history", {})
-                except Exception as e:
-                    return {"error": f"Tradier live fallback error: {e}"}
-
-        if not history or history == "null":
-            return {"error": "No trade history found in Tradier account."}
-
-        events = history.get("event", [])
-        if isinstance(events, dict):
-            events = [events]
-        all_events.extend(events)
-
-    # Apply date filter to Tradier events
-    if since:
-        all_events = [
-            e for e in all_events
-            if e.get("date", "")[:10] >= str(since)
-        ]
-        print(f"  [Tradier] After date filter ({since}): {len(all_events)} events remain", flush=True)
+    if not all_events:
+        return {"error": "No trade history found in Tradier account."}
 
     option_events = [
         e for e in all_events
         if e.get("type") == "trade" and e.get("trade", {}).get("trade_type") == "option"
     ]
 
-    print(f"  [Tradier] {len(all_events)} history events, {len(option_events)} option trades", flush=True)
+    # Expiration and assignment events would land here. Probed 2026-09-10 over
+    # the full account history: Tradier returns only `trade` and `ach` types for
+    # this account, and type=option is a synonym for type=trade rather than a
+    # corporate-action feed. Kept so the count is visible if that ever changes.
+    corporate_events = [e for e in all_events if e.get("type") not in ("trade", "ach")]
+
+    print(f"  [Tradier] {len(all_events)} history events, "
+          f"{len(option_events)} option trades, "
+          f"{len(corporate_events)} expiration/assignment events", flush=True)
 
     if not option_events:
         return {"error": f"No option trades found in history ({len(all_events)} total events were non-option or empty)."}
@@ -302,10 +444,20 @@ def fetch_pnl_from_tradier(trades: list, since=None) -> dict:
             "commission": float(trade.get("commission", 0)),
         })
 
+    # (e) executions come from fills, not from trades.json. trades.json records
+    # one row per ORDER at signal time at the ask, so it counts higher than the
+    # broker and prices differently.
+    entry_fills = sum(1 for e in option_events
+                      if float(e.get("trade", {}).get("quantity", 0)) > 0)
+    exit_fills  = sum(1 for e in option_events
+                      if float(e.get("trade", {}).get("quantity", 0)) < 0)
+
     trade_pnls   = []
     total_profit = 0.0
     total_loss   = 0.0
     open_trades  = []
+    expired_worthless = []
+    today = datetime.now().date()
 
     for symbol, events in by_symbol.items():
         buys  = [e for e in events if e["quantity"] > 0]
@@ -313,16 +465,33 @@ def fetch_pnl_from_tradier(trades: list, since=None) -> dict:
 
         if not buys:
             continue
+
+        expired = False
         if not sells:
-            open_trades.append(symbol)
-            continue
+            # A long option bought and never sold is either still open or it
+            # expired worthless. Tradier files no event when it expires, so the
+            # old code left these out of P&L entirely and called them "open" —
+            # which hides a total loss. Decide on the expiry in the symbol.
+            exp = _occ_expiry(symbol)
+            if exp is not None and exp < today:
+                expired = True
+                expired_worthless.append(symbol)
+            else:
+                open_trades.append(symbol)
+                continue
 
-        buy_qty  = sum(e["quantity"]       for e in buys)
-        sell_qty = sum(abs(e["quantity"])  for e in sells)
+        buy_qty  = sum(e["quantity"] for e in buys)
+        avg_buy  = sum(e["price"] * e["quantity"] for e in buys) / buy_qty
 
-        avg_buy  = sum(e["price"] * e["quantity"]       for e in buys)  / buy_qty
-        avg_sell = sum(e["price"] * abs(e["quantity"])  for e in sells) / sell_qty
-        qty      = min(buy_qty, sell_qty)
+        if expired:
+            # Worthless at expiry: the whole debit is the loss.
+            sell_qty = buy_qty
+            avg_sell = 0.0
+        else:
+            sell_qty = sum(abs(e["quantity"]) for e in sells)
+            avg_sell = sum(e["price"] * abs(e["quantity"]) for e in sells) / sell_qty
+
+        qty = min(buy_qty, sell_qty)
 
         gross_pnl   = (avg_sell - avg_buy) * qty * 100
         commissions = sum(e["commission"] for e in events)
@@ -341,6 +510,7 @@ def fetch_pnl_from_tradier(trades: list, since=None) -> dict:
             "buy":         avg_buy,
             "sell":        avg_sell,
             "commissions": commissions,
+            "expired":     expired,
         })
 
         if pnl >= 0:
@@ -372,10 +542,17 @@ def fetch_pnl_from_tradier(trades: list, since=None) -> dict:
         "best_trade":        max(trade_pnls, key=lambda x: x["pnl"])  if trade_pnls else None,
         "worst_trade":       min(trade_pnls, key=lambda x: x["pnl"])  if trade_pnls else None,
         "win_rate":          len(wins) / len(trade_pnls) * 100         if trade_pnls else 0,
+        "entry_fills":       entry_fills,
+        "exit_fills":        exit_fills,
+        "events_fetched":    len(all_events),
+        "window_start":      start,
+        "window_end":        end,
     }
 
     if open_trades:
         result["open_positions"] = open_trades
+    if expired_worthless:
+        result["expired_worthless"] = expired_worthless
 
     return result
 
@@ -411,6 +588,15 @@ def print_pnl_section(pnl: dict):
     if open_pos:
         print(f"\n  ⏳ {len(open_pos)} open position(s) — no closing trade found yet:")
 
+    exp = pnl.get("expired_worthless", [])
+    if exp:
+        # Counted as a 100% loss above. Tradier files no event when a long
+        # option expires, so without this they would sit in "open" forever and
+        # never reach the win rate.
+        print(f"\n  💸 {len(exp)} position(s) expired worthless "
+              f"— counted as total losses: {', '.join(exp[:6])}"
+              + (" ..." if len(exp) > 6 else ""))
+
     if pnl.get("trade_pnls") or open_pos:
         print(f"\n  {'SYMBOL':<25} {'QTY':>4}  {'BUY':>6}  {'SELL':>6}  {'P&L':>8}  {'%':>7}")
         print(f"  {'-'*25} {'-'*4}  {'-'*6}  {'-'*6}  {'-'*8}  {'-'*7}")
@@ -432,7 +618,16 @@ def print_report(trades: list, log_stats: dict, trade_stats: dict, pnl: dict, si
         print(f"  Period:    {since} → today")
     print(sep)
 
-    print("\n📊 AGENT ACTIVITY")
+    lo, hi = log_stats.get("log_date_min"), log_stats.get("log_date_max")
+    nfiles = len(log_stats.get("log_files_read", []))
+    if lo and hi:
+        window = f"{lo} → {hi}, {nfiles} log file(s)"
+        if since and lo > since:
+            # rotate 14 means anything older than a fortnight is simply gone
+            window += f" — truncated, no logs before {lo}"
+    else:
+        window = "no dated log lines found"
+    print(f"\n📊 AGENT ACTIVITY  ({window})")
     print(sep2)
     cycles   = log_stats.get("total_cycles", 0)
     no_sig   = log_stats.get("no_signal_cycles", 0)
@@ -470,7 +665,14 @@ def print_report(trades: list, log_stats: dict, trade_stats: dict, pnl: dict, si
 
     print(f"\n💰 TRADE SUMMARY")
     print(sep2)
-    print(f"  Total trades executed:  {trade_stats['total_trades']}")
+    fills = pnl.get("entry_fills")
+    if fills is not None:
+        print(f"  Total trades executed:  {fills}   (Tradier buy fills)")
+        print(f"  Orders recorded:        {trade_stats['total_trades']}   "
+              f"(trades.json — one row per ORDER at the ask, so it runs high)")
+    else:
+        print(f"  Total trades executed:  {trade_stats['total_trades']}   "
+              f"(trades.json — Tradier unavailable, see P&L section)")
     print(f"  Total capital deployed: ${trade_stats['total_deployed']:,.2f}")
     print(f"  Avg cost per trade:     ${trade_stats['avg_trade_cost']:.2f}")
     print(f"  Avg contracts per trade:{trade_stats['avg_contracts']:.1f}")

@@ -121,6 +121,9 @@ class ShadowLogger:
                         "stage": e.get("stage"),        # where it was rejected
                         "implied_direction": e.get("direction"),
                         "score": e.get("score"),
+                        # v5.23: bonus already inside "score", so a study can
+                        # re-score every signal as if the bonus were 0.
+                        "regime_bonus": e.get("regime_bonus"),
                         "call_tfs": e.get("call_tfs"),
                         "put_tfs": e.get("put_tfs"),
                         "spot": e.get("spot"),
@@ -242,6 +245,9 @@ class ShadowLogger:
                    ("ts", "ticker", "stage", "implied_direction", "score",
                     "regime", "vix", "accepted", "spot")}
             out["cohort"] = rec.get("cohort", "legacy")
+            # v5.23: carried through so regime_bonus_study.py can re-score.
+            if rec.get("regime_bonus") is not None:
+                out["regime_bonus"] = rec["regime_bonus"]
             got = False
             for h in HORIZONS_MIN:
                 target = t0 + timedelta(minutes=h)
